@@ -1,0 +1,494 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WealthTrack 资产总览</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css?v=20260406-2">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand-block">
+        <p class="eyebrow">WealthTrack</p>
+        <h1>资产仪表盘</h1>
+        <p class="sidebar-text">支持多用户登录、云端保存、跨设备查看。</p>
+      </div>
+
+      <section class="account-strip" id="auth-panel">
+        <div class="panel-header">
+          <div>
+            <p class="section-tag">账户</p>
+            <h2>账户中心</h2>
+          </div>
+        </div>
+
+        <div id="auth-guest">
+          <div class="auth-entry-actions">
+            <button class="primary-button" data-open-auth-modal="login" type="button">登录</button>
+            <button class="ghost-button" data-open-auth-modal="register" type="button">注册</button>
+          </div>
+          <p class="settings-tip">登录后，资产和设置会自动保存到服务器，并与你的账号绑定。</p>
+        </div>
+
+        <div id="auth-user" class="hidden">
+          <p class="sidebar-text">当前用户：<strong id="current-username">-</strong></p>
+          <div class="form-actions">
+            <button id="logout-button" type="button" class="ghost-button">退出登录</button>
+          </div>
+        </div>
+      </section>
+
+      <nav class="menu-nav" aria-label="主菜单">
+        <button class="menu-button is-active" data-view-target="dashboard">首页</button>
+        <button class="menu-button" data-view-target="entry">资产录入</button>
+          <button class="menu-button" data-view-target="platforms">账户总览</button>
+        <button class="menu-button" data-view-target="assets">资产明细</button>
+        <button class="menu-button" data-view-target="settings">行情设置</button>
+        <button class="menu-button" data-view-target="account">账户中心</button>
+      </nav>
+
+      <section class="panel">
+        <div class="panel-header panel-header--compact">
+          <div>
+            <p class="section-tag">显示</p>
+            <h2>展示币种</h2>
+          </div>
+        </div>
+        <label>
+          <span>金额显示</span>
+          <select id="display-currency">
+            <option value="CNY">人民币 CNY</option>
+            <option value="USD">美元 USD</option>
+          </select>
+        </label>
+      </section>
+    </aside>
+
+    <main class="content-shell">
+        <section id="auth-required-banner" class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-tag">开始使用</p>
+              <h2>先登录，再加载你的资产</h2>
+            </div>
+          </div>
+          <p class="settings-tip">资产、设置和后续统计都将绑定到你的账号，并保存到服务器上的 SQLite 数据库。</p>
+          <div class="auth-entry-actions">
+            <button class="primary-button" data-open-auth-modal="login" type="button">登录</button>
+            <button class="ghost-button" data-open-auth-modal="register" type="button">注册</button>
+          </div>
+        </section>
+
+      <section class="view-panel is-active" data-view="dashboard">
+        <section class="hero panel">
+          <div class="hero-copy">
+            <div id="asset-distribution-card" class="distribution-card">
+              <div class="distribution-card__head">
+                <span>资产分布</span>
+                <small id="asset-distribution-total">暂无数据</small>
+              </div>
+              <div class="distribution-card__body">
+                <div id="asset-distribution-chart" class="distribution-card__chart"></div>
+                <div id="asset-distribution-legend" class="distribution-card__legend"></div>
+              </div>
+            </div>
+          </div>
+          <div class="hero-card">
+            <div class="hero-card__top">
+              <span>最近刷新</span>
+              <div class="inline-meta">
+                <span id="display-currency-badge" class="display-currency-badge">CNY</span>
+                <span id="last-sync-label">未刷新</span>
+              </div>
+            </div>
+            <p class="hero-card__note">当日盈亏</p>
+            <div class="hero-card__figure" id="hero-daily-profit-main">¥0.00</div>
+            <div class="hero-card__grid">
+              <div>
+                <span>今日收益率</span>
+                <strong id="hero-daily-profit-rate">0.00%</strong>
+              </div>
+              <div>
+                <span>累计收益率</span>
+                <strong id="hero-total-profit-rate">0.00%</strong>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <section id="platform-profit-panel" class="panel">
+          <div id="platform-profit-compact" class="platform-profit-strip"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>账户总览</h2>
+            </div>
+            <span id="display-currency-badge-summary" class="display-currency-badge">CNY</span>
+            <button id="refresh-prices-btn" class="ghost-button">刷新实时价格</button>
+          </div>
+          <div id="dashboard-risk-banner" class="risk-banner hidden"></div>
+          <div class="stats-grid">
+            <article class="stat-card">
+              <span>净资产</span>
+              <strong id="total-assets">¥0.00</strong>
+              <small>资产减去负债后的总额</small>
+            </article>
+            <article class="stat-card">
+              <span>总成本</span>
+              <strong id="total-cost">¥0.00</strong>
+              <small>买入成本与负债本金合计</small>
+            </article>
+            <article class="stat-card">
+              <span>累计收益</span>
+              <strong id="total-profit">¥0.00</strong>
+              <small id="total-profit-rate">0.00%</small>
+            </article>
+            <article class="stat-card">
+              <span>今日收益</span>
+              <strong id="daily-profit">¥0.00</strong>
+              <small>基于昨收或昨日净值估算</small>
+            </article>
+            <article class="stat-card">
+              <span>融资金额</span>
+              <strong id="total-margin">¥0.00</strong>
+              <small>所有账户融资占用合计</small>
+            </article>
+            <article class="stat-card">
+              <span>账户余额</span>
+              <strong id="total-cash-balance">¥0.00</strong>
+              <small>所有账户正向自由资金合计</small>
+            </article>
+          </div>
+        </section>
+      </section>
+
+      <div id="platform-profit-modal" class="modal hidden" aria-hidden="true">
+        <div class="modal-backdrop" data-close-platform-profit-modal></div>
+        <div class="modal-dialog">
+          <section class="panel modal-panel modal-panel--wide">
+            <div class="panel-header">
+              <div>
+                <p class="section-tag">平台盈亏</p>
+                <h2>全部平台</h2>
+              </div>
+              <button type="button" class="ghost-button" data-close-platform-profit-modal>关闭</button>
+            </div>
+            <div id="platform-profit-modal-list" class="platform-profit-modal-list"></div>
+          </section>
+        </div>
+      </div>
+
+      <section class="view-panel" data-view="entry">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-tag">录入</p>
+              <h2>新增或编辑资产</h2>
+            </div>
+            <button id="reset-form-btn" class="ghost-button">清空表单</button>
+          </div>
+
+          <form id="asset-form" class="asset-form">
+            <input type="hidden" id="asset-id" name="id">
+
+            <label>
+              <span>资产名称</span>
+              <input id="asset-name" name="name" type="text" placeholder="例如：支付宝基金 / IBKR AAPL / 房贷" required>
+            </label>
+
+            <div class="form-row form-row--quad">
+              <label>
+                <span>平台来源</span>
+                <select id="asset-platform" name="platform" required>
+                  <option value="alipay">支付宝</option>
+                  <option value="southfund">南方基金</option>
+                  <option value="tonghuashun">同花顺</option>
+                  <option value="okx">欧意 OKX</option>
+                  <option value="ibkr">IBKR</option>
+                  <option value="schwab">嘉信理财</option>
+                  <option value="bank">现金 / 银行</option>
+                  <option value="other">其他</option>
+                </select>
+              </label>
+
+              <label>
+                <span>资产类型</span>
+                <select id="asset-type" name="type" required>
+                  <option value="fund">场外基金</option>
+                  <option value="stock">股票 / ETF</option>
+                  <option value="crypto">BTC / 加密货币</option>
+                  <option value="cash">现金</option>
+                  <option value="liability">负债</option>
+                </select>
+              </label>
+
+              <label>
+                <span>资产范围</span>
+                <select id="asset-region">
+                  <option value="domestic">境内资产</option>
+                  <option value="overseas">境外资产</option>
+                </select>
+              </label>
+
+              <label>
+                <span>代码</span>
+                <input id="asset-symbol" name="symbol" type="text" placeholder="600519.SH / 159915.SZ / 000001.OF / AAPL / BTCUSDT" required>
+              </label>
+            </div>
+            <p id="asset-symbol-validation" class="field-hint field-hint-error hidden"></p>
+            <p id="asset-symbol-hint" class="field-hint">代码会根据平台和资产类型自动规范化，例如 `600519` 会转成 `600519.SH`。</p>
+
+            <label id="asset-source-row" class="hidden">
+              <span>行情来源</span>
+              <select id="asset-source-select">
+                <option value="manual">手动</option>
+                <option value="fund_eastmoney">场外基金净值</option>
+                <option value="tushare">Tushare 实时</option>
+                <option value="finnhub">Finnhub</option>
+                <option value="binance">Binance</option>
+              </select>
+            </label>
+
+            <div class="form-row form-row--triple">
+              <label>
+                <span>持有数量</span>
+                <input id="asset-quantity" name="quantity" type="number" step="0.000001" min="0" placeholder="0" required>
+              </label>
+
+              <label>
+                <span>成本单价</span>
+                <input id="asset-cost" name="costPrice" type="number" step="0.000001" min="0" placeholder="0" required>
+              </label>
+
+              <label>
+                <span id="asset-price-label">最新单价</span>
+                <input id="asset-price" name="currentPrice" type="number" step="0.000001" min="0" placeholder="可手动录入">
+              </label>
+              <input id="asset-prev-close" name="previousClose" type="hidden" value="0">
+              <input id="asset-quote-date" name="quoteDate" type="hidden" value="">
+            </div>
+            <p id="asset-price-autofill-hint" class="field-hint hidden"></p>
+
+            <input id="asset-source" name="quoteSource" type="hidden" value="tushare">
+            <input id="asset-currency" name="currency" type="hidden" value="CNY">
+            <input id="asset-fx-rate" name="fxRate" type="hidden" value="1">
+            <input id="asset-notes" name="notes" type="hidden" value="">
+
+            <div class="form-actions">
+              <button type="submit" class="primary-button">保存资产</button>
+            </div>
+          </form>
+        </section>
+      </section>
+
+        <section class="view-panel" data-view="platforms">
+          <section class="panel">
+            <div class="panel-header">
+              <div>
+                <p class="section-tag">账户</p>
+                <h2>账户总览</h2>
+              </div>
+              <select id="account-overview-currency" class="account-overview-currency-select">
+                <option value="CNY">CNY</option>
+                <option value="USD">USD</option>
+              </select>
+            </div>
+              <div id="platform-summary-grid" class="stats-grid">
+                <article class="stat-card">
+                  <span>暂无账户数据</span>
+                <strong>¥0.00</strong>
+                <small>录入资产后会自动汇总</small>
+              </article>
+            </div>
+        </section>
+      </section>
+
+      <section class="view-panel" data-view="assets">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-tag">明细</p>
+              <h2>资产明细</h2>
+            </div>
+            <span id="display-currency-badge-assets" class="display-currency-badge">CNY</span>
+            <div class="table-actions">
+              <button id="export-assets-btn" class="ghost-button" type="button">导出资产</button>
+              <button id="import-assets-btn" class="ghost-button" type="button">导入资产</button>
+              <button id="clear-assets-btn" class="danger-button" type="button">清空全部资产</button>
+            </div>
+          </div>
+          <input id="import-assets-file" type="file" accept="application/json,.json" class="hidden">
+
+          <div class="filter-bar">
+            <label class="filter-field">
+              <span>资产类型筛选</span>
+              <select id="asset-type-filter">
+                <option value="all">全部类型</option>
+                <option value="fund">场外基金</option>
+                <option value="stock">股票 / ETF</option>
+                <option value="crypto">BTC / 加密货币</option>
+                <option value="cash">现金</option>
+                <option value="liability">负债</option>
+              </select>
+            </label>
+            <button id="clear-filter-btn" class="ghost-button" type="button">清空筛选</button>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>资产</th>
+                  <th>数量</th>
+                  <th>成本</th>
+                  <th>现价</th>
+                  <th>市值</th>
+                  <th>累计收益</th>
+                  <th>今日收益</th>
+                  <th>来源状态</th>
+                  <th>操作</th>
+                </tr>
+              </thead>
+              <tbody id="asset-table-body">
+                <tr class="empty-row">
+                  <td colspan="9">还没有资产，先录入第一笔持仓吧。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div id="asset-card-list" class="asset-card-list">
+            <article class="mobile-asset-card empty-mobile-card">
+              <p>还没有资产，先录入第一笔持仓吧。</p>
+            </article>
+          </div>
+        </section>
+      </section>
+
+      <section class="view-panel" data-view="account">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-tag">账户</p>
+              <h2>账户中心</h2>
+            </div>
+          </div>
+          <div id="account-view-guest">
+            <p class="settings-tip">登录后，资产和设置会自动保存到服务器，并与你的账户绑定。</p>
+            <div class="auth-entry-actions">
+              <button class="primary-button" data-open-auth-modal="login" type="button">登录</button>
+              <button class="ghost-button" data-open-auth-modal="register" type="button">注册</button>
+            </div>
+          </div>
+          <div id="account-view-user" class="hidden">
+            <div class="account-page-card">
+              <span class="account-label">当前登录</span>
+              <strong class="current-username">-</strong>
+            </div>
+            <div class="form-actions">
+              <button id="account-logout-button" type="button" class="ghost-button">退出登录</button>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="view-panel" data-view="settings">
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-tag">设置</p>
+              <h2>行情配置</h2>
+            </div>
+            <button id="refresh-provider-status-button" type="button" class="ghost-button">刷新接口状态</button>
+          </div>
+          <div id="provider-status-grid" class="provider-status-grid provider-status-grid--interactive"></div>
+
+          <div class="panel-subcard">
+            <div class="panel-header panel-header--compact">
+              <div>
+                <p class="section-tag">详情</p>
+                <h2 id="provider-detail-title">Alpha Vantage</h2>
+              </div>
+            </div>
+            <p id="provider-detail-description" class="settings-tip"></p>
+            <div id="provider-detail-status-line" class="provider-detail-status"></div>
+            <div id="provider-detail-links" class="provider-detail-links"></div>
+            <div class="provider-detail-configs">
+              <label id="alpha-vantage-config">
+                <span>Finnhub API Key</span>
+                <input id="alpha-vantage-key" type="password" placeholder="用于美股 / 海外资产">
+              </label>
+              <label id="tushare-config">
+                <span>Tushare Token</span>
+                <input id="tushare-token" type="password" placeholder="用于 A 股 / ETF / 中国基金">
+              </label>
+            </div>
+          </div>
+          <div class="settings-grid single-row-settings">
+            <label>
+              <span>自动刷新间隔</span>
+              <select id="auto-refresh-interval">
+                <option value="0">关闭自动刷新</option>
+                <option value="60">每 1 分钟</option>
+                <option value="300">每 5 分钟</option>
+                <option value="900">每 15 分钟</option>
+              </select>
+            </label>
+          </div>
+          <div class="form-actions">
+            <button id="save-settings-button" type="button" class="primary-button">保存设置</button>
+          </div>
+          <p class="settings-tip">
+            建议规则：支付宝基金、同花顺 A 股和 ETF 用 Tushare；IBKR / 嘉信理财用 Finnhub；BTC 用 Binance。
+            如果是支付宝场外基金，建议代码填写基金代码，例如 `000001.OF`。
+          </p>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <div id="auth-modal" class="modal hidden">
+    <div class="modal-backdrop" data-close-auth-modal="true"></div>
+    <div class="modal-dialog">
+      <div class="panel modal-panel">
+        <div class="panel-header">
+          <div>
+            <p class="section-tag">账户</p>
+            <h2 id="auth-title">登录账户</h2>
+          </div>
+          <button id="close-auth-modal-button" class="ghost-button" type="button">关闭</button>
+        </div>
+
+        <div class="auth-tabs">
+          <button class="ghost-button is-auth-active" data-auth-mode="login" type="button">登录</button>
+          <button class="ghost-button" data-auth-mode="register" type="button">注册</button>
+        </div>
+
+        <form id="auth-form" class="asset-form">
+          <label>
+            <span>用户名</span>
+            <input id="auth-username" type="text" autocomplete="username" required>
+          </label>
+          <label>
+            <span>密码</span>
+            <input id="auth-password" type="password" autocomplete="current-password" required>
+          </label>
+          <div class="form-actions">
+            <button id="auth-submit-button" type="submit" class="primary-button">登录</button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" aria-live="polite"></div>
+
+  <script src="./app.js?v=20260406-2"></script>
+</body>
+</html>

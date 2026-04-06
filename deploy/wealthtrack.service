@@ -1,0 +1,16 @@
+[Unit]
+Description=WealthTrack FastAPI Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/wealthtrack
+Environment=WEALTHTRACK_SECRET=please-change-this-secret
+ExecStart=/usr/bin/python3 -m uvicorn backend:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1228 @@
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import sqlite3
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from time import time
+from typing import Any
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+from fastapi import Cookie, FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
+DB_PATH = DATA_DIR / "wealthtrack.db"
+SESSION_COOKIE = "wealthtrack_session"
+SESSION_TTL_DAYS = 14
+APP_SECRET = os.environ.get("WEALTHTRACK_SECRET", "change-me-in-production")
+PROVIDER_STATUS_CACHE_TTL_SECONDS = 300
+provider_status_cache: dict[str, Any] = {"key": None, "expires_at": 0.0, "providers": None}
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "12345678"
+DEFAULT_FINNHUB_KEY = "d797klhr01qqpmhfoog0d797klhr01qqpmhfoogg"
+DEFAULT_TUSHARE_TOKEN = "25790f70139144b663e37f1806836ba2a55bf0adb90e4bfb9dd85873"
+BINANCE_PUBLIC_BASE_URLS = ["https://data-api.binance.vision", "https://api.binance.com"]
+
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def get_db() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH)
+    connection.row_factory = sqlite3.Row
+    return connection
+
+
+def ensure_user_settings_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(user_settings)").fetchall()}
+    if "tushare_token" not in columns:
+        conn.execute("ALTER TABLE user_settings ADD COLUMN tushare_token TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+        columns.add("tushare_token")
+    if "finnhub_key" not in columns:
+        conn.execute("ALTER TABLE user_settings ADD COLUMN finnhub_key TEXT NOT NULL DEFAULT ''")
+        if "alpha_vantage_key" in columns:
+            conn.execute(
+                """
+                UPDATE user_settings
+                SET finnhub_key = alpha_vantage_key
+                WHERE finnhub_key = '' AND alpha_vantage_key <> ''
+                """
+            )
+        conn.commit()
+
+
+def ensure_account_balance_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(account_balances)").fetchall()}
+    if "display_currency" not in columns:
+        conn.execute("ALTER TABLE account_balances ADD COLUMN display_currency TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+
+
+def ensure_asset_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(assets)").fetchall()}
+    if "quote_date" not in columns:
+        conn.execute("ALTER TABLE assets ADD COLUMN quote_date TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+
+
+def ensure_admin_user(conn: sqlite3.Connection) -> None:
+    username = ADMIN_USERNAME
+    salt = secrets.token_hex(16)
+    password_hash = hash_password(ADMIN_PASSWORD, salt)
+    existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if existing:
+        conn.execute(
+            """
+            UPDATE users
+            SET password_hash = ?, password_salt = ?
+            WHERE username = ?
+            """,
+            (password_hash, salt, username),
+        )
+    else:
+        cursor = conn.execute(
+            "INSERT INTO users (username, password_hash, password_salt, created_at) VALUES (?, ?, ?, ?)",
+            (username, password_hash, salt, now_iso()),
+        )
+        conn.execute(
+            """
+            INSERT INTO user_settings (user_id, finnhub_key, tushare_token, auto_refresh_interval, last_sync_at)
+            VALUES (?, ?, ?, 0, '')
+            """,
+            (int(cursor.lastrowid), DEFAULT_FINNHUB_KEY, DEFAULT_TUSHARE_TOKEN),
+        )
+    conn.commit()
+
+
+def init_db() -> None:
+    with closing(get_db()) as conn:
+        conn.executescript(
+            """
+            PRAGMA foreign_keys = ON;
+
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                password_salt TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                finnhub_key TEXT NOT NULL DEFAULT '',
+                tushare_token TEXT NOT NULL DEFAULT '',
+                auto_refresh_interval INTEGER NOT NULL DEFAULT 0,
+                last_sync_at TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS assets (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                type TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                quantity REAL NOT NULL,
+                cost_price REAL NOT NULL,
+                current_price REAL NOT NULL DEFAULT 0,
+                previous_close REAL NOT NULL DEFAULT 0,
+                currency TEXT NOT NULL,
+                fx_rate REAL NOT NULL DEFAULT 1,
+                quote_source TEXT NOT NULL,
+                quote_date TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS account_balances (
+                user_id INTEGER NOT NULL,
+                platform TEXT NOT NULL,
+                free_cash REAL NOT NULL DEFAULT 0,
+                display_currency TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, platform),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            """
+        )
+        ensure_user_settings_columns(conn)
+        ensure_account_balance_columns(conn)
+        ensure_asset_columns(conn)
+        ensure_admin_user(conn)
+        conn.commit()
+
+
+def hash_password(password: str, salt: str) -> str:
+    return hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        200_000,
+    ).hex()
+
+
+def create_session_token(user_id: int) -> str:
+    expires_at = int((datetime.now(timezone.utc) + timedelta(days=SESSION_TTL_DAYS)).timestamp())
+    payload = f"{user_id}:{expires_at}"
+    signature = hmac.new(APP_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
+    encoded_signature = base64.urlsafe_b64encode(signature).decode("utf-8")
+    return f"{payload}:{encoded_signature}"
+
+
+def verify_session_token(token: str) -> int:
+    try:
+        user_id_text, expires_at_text, signature = token.split(":", 2)
+        payload = f"{user_id_text}:{expires_at_text}"
+        expected = base64.urlsafe_b64encode(
+            hmac.new(APP_SECRET.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
+        ).decode("utf-8")
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError("bad signature")
+        if int(expires_at_text) < int(datetime.now(timezone.utc).timestamp()):
+            raise ValueError("expired")
+        return int(user_id_text)
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="登录已失效，请重新登录") from exc
+
+
+def read_json_url(url: str) -> Any:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "application/json,text/plain,*/*",
+        },
+    )
+    with urlopen(request, timeout=20) as response:
+        return json.load(response)
+
+
+def read_text_url(url: str) -> str:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        },
+    )
+    with urlopen(request, timeout=20) as response:
+        content_type = response.headers.get_content_charset() or "utf-8"
+        return response.read().decode(content_type, errors="ignore")
+
+
+def fetch_fx_rate_primary(base_currency: str, quote_currency: str) -> float:
+    payload = read_json_url(f"https://api.frankfurter.dev/v2/rate/{base_currency}/{quote_currency}")
+    if isinstance(payload, (int, float)):
+        return float(payload)
+    if payload.get("rate"):
+        return float(payload["rate"])
+    if payload.get("rates") and payload["rates"].get(quote_currency):
+        return float(payload["rates"][quote_currency])
+    raise ValueError("Primary FX payload invalid")
+
+
+def fetch_fx_rate_fallback(base_currency: str, quote_currency: str) -> float:
+    payload = read_json_url(f"https://open.er-api.com/v6/latest/{base_currency}")
+    if payload.get("result") != "success":
+        raise ValueError("Fallback FX payload invalid")
+    rates = payload.get("rates", {})
+    if quote_currency not in rates:
+        raise ValueError("Fallback FX quote missing")
+    return float(rates[quote_currency])
+
+
+def fetch_fx_rates(currencies: list[str], quote_currency: str = "CNY") -> dict[str, Any]:
+    rates: dict[str, float] = {}
+    source = "primary"
+    try:
+        for currency in currencies:
+            rates[currency] = fetch_fx_rate_primary(currency, quote_currency)
+        return {"rates": rates, "source": source}
+    except Exception:
+        source = "fallback"
+        for currency in currencies:
+            rates[currency] = fetch_fx_rate_fallback(currency, quote_currency)
+        return {"rates": rates, "source": source}
+
+
+def import_tushare():
+    try:
+        import tushare as ts
+    except ImportError as exc:
+        raise HTTPException(status_code=500, detail="服务器未安装 tushare，请先安装 requirements.txt") from exc
+    return ts
+
+
+class RegisterPayload(BaseModel):
+    username: str = Field(min_length=3, max_length=50)
+    password: str = Field(min_length=8, max_length=100)
+
+
+class LoginPayload(RegisterPayload):
+    pass
+
+
+class AssetPayload(BaseModel):
+    id: str
+    name: str
+    platform: str
+    type: str
+    symbol: str
+    quantity: float
+    costPrice: float
+    currentPrice: float = 0
+    previousClose: float = 0
+    currency: str
+    fxRate: float = 1
+    quoteSource: str
+    quoteDate: str = ""
+    notes: str = ""
+    updatedAt: str
+
+
+class SettingsPayload(BaseModel):
+    finnhubKey: str = ""
+    tushareToken: str = ""
+    autoRefreshInterval: int = 0
+    lastSyncAt: str = ""
+
+
+class AccountBalancePayload(BaseModel):
+    platform: str
+    freeCash: float = 0
+    displayCurrency: str = ""
+    updatedAt: str
+
+
+app = FastAPI(title="WealthTrack API")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    init_db()
+
+
+def get_current_user(session_cookie: str | None) -> sqlite3.Row:
+    if not session_cookie:
+        raise HTTPException(status_code=401, detail="请先登录")
+    user_id = verify_session_token(session_cookie)
+    with closing(get_db()) as conn:
+        user = conn.execute("SELECT id, username, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    return user
+
+
+def is_admin_user(user: sqlite3.Row | dict[str, Any]) -> bool:
+    return str(user["username"]).strip().lower() == ADMIN_USERNAME
+
+
+def get_admin_user_id(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT id FROM users WHERE username = ?", (ADMIN_USERNAME,)).fetchone()
+    if not row:
+        ensure_admin_user(conn)
+        row = conn.execute("SELECT id FROM users WHERE username = ?", (ADMIN_USERNAME,)).fetchone()
+    return int(row["id"])
+
+
+def get_shared_settings(conn: sqlite3.Connection) -> sqlite3.Row:
+    admin_user_id = get_admin_user_id(conn)
+    return ensure_settings(conn, admin_user_id)
+
+
+def ensure_settings(conn: sqlite3.Connection, user_id: int) -> sqlite3.Row:
+    ensure_user_settings_columns(conn)
+    settings = conn.execute(
+        """
+        SELECT user_id, finnhub_key, tushare_token, auto_refresh_interval, last_sync_at
+        FROM user_settings
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+    if settings:
+        admin_user_id = get_admin_user_id(conn)
+        if user_id == admin_user_id and (not settings["finnhub_key"] or not settings["tushare_token"]):
+            conn.execute(
+                """
+                UPDATE user_settings
+                SET finnhub_key = ?, tushare_token = ?
+                WHERE user_id = ?
+                """,
+                (
+                    settings["finnhub_key"] or DEFAULT_FINNHUB_KEY,
+                    settings["tushare_token"] or DEFAULT_TUSHARE_TOKEN,
+                    user_id,
+                ),
+            )
+            conn.commit()
+            settings = conn.execute(
+                """
+                SELECT user_id, finnhub_key, tushare_token, auto_refresh_interval, last_sync_at
+                FROM user_settings
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            ).fetchone()
+        return settings
+
+    conn.execute(
+        """
+        INSERT INTO user_settings (user_id, finnhub_key, tushare_token, auto_refresh_interval, last_sync_at)
+        VALUES (?, ?, ?, 0, '')
+        """,
+        (
+            user_id,
+            DEFAULT_FINNHUB_KEY if user_id == get_admin_user_id(conn) else '',
+            DEFAULT_TUSHARE_TOKEN if user_id == get_admin_user_id(conn) else '',
+        ),
+    )
+    conn.commit()
+    return conn.execute(
+        """
+        SELECT user_id, finnhub_key, tushare_token, auto_refresh_interval, last_sync_at
+        FROM user_settings
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchone()
+
+
+def normalize_cn_symbol(symbol: str, asset_type: str, platform: str) -> str:
+    cleaned = symbol.strip().upper()
+    if "." in cleaned or not cleaned.isdigit():
+        return cleaned
+
+    if asset_type == "fund" and platform == "alipay":
+        return f"{cleaned}.OF"
+
+    if cleaned.startswith(("5", "6", "9")):
+        return f"{cleaned}.SH"
+    return f"{cleaned}.SZ"
+
+
+def read_series_value(record: Any, *candidates: str) -> float:
+    for key in candidates:
+        for candidate in (key, key.lower(), key.upper()):
+            if candidate in record and record[candidate] is not None and str(record[candidate]).strip() != "":
+                return float(record[candidate])
+    raise KeyError(f"Missing fields: {candidates}")
+
+
+def to_quote_date(value: Any) -> str:
+    if value in (None, ""):
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        if len(text) == 8:
+            return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+        try:
+            timestamp = int(text)
+            if timestamp > 10_000_000_000:
+                timestamp = timestamp / 1000
+            return datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+        except Exception:
+            return ""
+    match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
+    if match:
+        year, month, day = match.groups()
+        return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
+    return ""
+
+
+def read_series_date(record: Any, *candidates: str) -> str:
+    for key in candidates:
+        for candidate in (key, key.lower(), key.upper()):
+            if candidate in record and record[candidate] is not None and str(record[candidate]).strip() != "":
+                parsed = to_quote_date(record[candidate])
+                if parsed:
+                    return parsed
+    return ""
+
+
+def resolve_finnhub_quote(asset: AssetPayload, settings: sqlite3.Row) -> dict[str, Any]:
+    api_key = settings["finnhub_key"]
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请先在设置里填写 Finnhub API Key")
+
+    symbol = asset.symbol.strip().upper()
+    query = urlencode({"symbol": symbol, "token": api_key})
+    payload = read_json_url(f"https://finnhub.io/api/v1/quote?{query}")
+    current_price = float(payload.get("c", 0) or 0)
+    if current_price <= 0:
+        raise HTTPException(status_code=502, detail="Finnhub 未返回有效报价")
+
+    return {
+        "currentPrice": current_price,
+        "previousClose": float(payload.get("pc", asset.previousClose) or asset.previousClose),
+        "normalizedSymbol": symbol,
+        "quoteSource": "finnhub",
+        "quoteDate": to_quote_date(payload.get("t")),
+    }
+
+
+def resolve_binance_quote(asset: AssetPayload) -> dict[str, Any]:
+    symbol = asset.symbol.strip().upper()
+    payload = None
+    last_error: Exception | None = None
+    for base_url in BINANCE_PUBLIC_BASE_URLS:
+        try:
+            payload = read_json_url(f"{base_url}/api/v3/ticker/24hr?symbol={symbol}")
+            break
+        except Exception as exc:
+            last_error = exc
+    if payload is None:
+        raise HTTPException(status_code=502, detail=f"Binance 行情接口不可用：{last_error}")
+    return {
+        "currentPrice": float(payload.get("lastPrice", 0) or 0),
+        "previousClose": float(payload.get("prevClosePrice", asset.previousClose) or asset.previousClose),
+        "normalizedSymbol": symbol,
+        "quoteSource": "binance",
+        "quoteDate": to_quote_date(payload.get("closeTime")),
+    }
+
+
+def resolve_tushare_fund_quote(asset: AssetPayload, settings: sqlite3.Row) -> dict[str, Any]:
+    token = settings["tushare_token"]
+    if not token:
+        raise HTTPException(status_code=400, detail="请先在设置里填写 Tushare Token")
+
+    ts = import_tushare()
+    pro = ts.pro_api(token)
+    ts_code = normalize_cn_symbol(asset.symbol, asset.type, asset.platform)
+    market = "O" if ts_code.endswith(".OF") else "E"
+    dataframe = pro.fund_nav(ts_code=ts_code, market=market)
+    if dataframe is None or dataframe.empty:
+        raise HTTPException(status_code=404, detail=f"Tushare 未找到基金净值：{ts_code}")
+
+    dataframe = dataframe.sort_values("nav_date", ascending=False)
+    previous_close = float(dataframe.iloc[1]["unit_nav"]) if len(dataframe.index) > 1 else asset.previousClose
+    return {
+        "currentPrice": float(dataframe.iloc[0]["unit_nav"]),
+        "previousClose": previous_close,
+        "normalizedSymbol": ts_code,
+        "quoteSource": "tushare",
+    }
+
+
+def resolve_tushare_realtime_quote(asset: AssetPayload, settings: sqlite3.Row) -> dict[str, Any]:
+    token = settings["tushare_token"]
+    if not token:
+        raise HTTPException(status_code=400, detail="请先在设置里填写 Tushare Token")
+
+    ts = import_tushare()
+    ts.set_token(token)
+    ts_code = normalize_cn_symbol(asset.symbol, asset.type, asset.platform)
+    dataframe = ts.realtime_quote(ts_code=ts_code, src="dc")
+    if dataframe is None or dataframe.empty:
+        raise HTTPException(status_code=404, detail=f"Tushare 未找到实时行情：{ts_code}")
+
+    row = dataframe.iloc[0]
+    return {
+        "currentPrice": read_series_value(row, "price", "close", "last"),
+        "previousClose": read_series_value(row, "pre_close", "prev_close"),
+        "normalizedSymbol": ts_code,
+        "quoteSource": "tushare",
+        "quoteDate": read_series_date(row, "date", "trade_date"),
+    }
+
+
+def resolve_quote(asset: AssetPayload, settings: sqlite3.Row) -> dict[str, Any]:
+    if asset.type in {"cash", "liability"} or asset.quoteSource == "manual":
+        return {
+            "currentPrice": asset.currentPrice,
+            "previousClose": asset.previousClose,
+            "normalizedSymbol": asset.symbol,
+            "quoteSource": "manual",
+            "quoteDate": asset.quoteDate,
+        }
+
+    if asset.quoteSource == "binance":
+        return resolve_binance_quote(asset)
+
+    if asset.quoteSource == "finnhub":
+        return resolve_finnhub_quote(asset, settings)
+
+    if asset.quoteSource == "fund_eastmoney":
+        return resolve_tushare_fund_quote(asset, settings)
+
+    if asset.quoteSource == "tushare":
+        if asset.type == "fund":
+            return resolve_tushare_fund_quote(asset, settings)
+        return resolve_tushare_realtime_quote(asset, settings)
+
+    raise HTTPException(status_code=400, detail=f"暂不支持的数据源：{asset.quoteSource}")
+
+
+def check_finnhub_status(settings: sqlite3.Row) -> dict[str, str]:
+    api_key = settings["finnhub_key"]
+    if not api_key:
+        return {"status": "warning", "message": "未填写 API Key", "checkedAt": now_iso()}
+
+    try:
+        query = urlencode(
+            {
+                "function": "GLOBAL_QUOTE",
+                "symbol": "IBM",
+                "apikey": api_key,
+            }
+        )
+        payload = read_json_url(f"https://www.alphavantage.co/query?{query}")
+        quote = payload.get("Global Quote", {})
+        if quote and quote.get("05. price"):
+            return {"status": "ok", "message": "接口正常", "checkedAt": now_iso()}
+        if payload.get("Note") or payload.get("Information") or payload.get("Error Message"):
+            return {
+                "status": "error",
+                "message": str(payload.get("Note") or payload.get("Information") or payload.get("Error Message"))[:120],
+                "checkedAt": now_iso(),
+            }
+        return {"status": "error", "message": "未返回有效报价", "checkedAt": now_iso()}
+    except Exception as exc:
+        return {"status": "error", "message": f"请求失败：{str(exc)[:80]}", "checkedAt": now_iso()}
+
+
+def check_tushare_status(settings: sqlite3.Row) -> dict[str, str]:
+    token = settings["tushare_token"]
+    if not token:
+        return {"status": "warning", "message": "未填写 Tushare Token", "checkedAt": now_iso()}
+
+    try:
+        ts = import_tushare()
+        pro = ts.pro_api(token)
+        dataframe = pro.trade_cal(exchange="SSE", limit=1)
+        if dataframe is not None and not dataframe.empty:
+            return {"status": "ok", "message": "接口正常", "checkedAt": now_iso()}
+        return {"status": "error", "message": "未返回有效数据", "checkedAt": now_iso()}
+    except Exception as exc:
+        return {"status": "error", "message": f"请求失败或 Token 无效：{str(exc)[:80]}", "checkedAt": now_iso()}
+
+
+def check_tushare_realtime_status(settings: sqlite3.Row) -> dict[str, str]:
+    token = settings["tushare_token"]
+    if not token:
+        return {"status": "warning", "message": "未填写 Tushare Token", "checkedAt": now_iso()}
+
+    try:
+        ts = import_tushare()
+        ts.set_token(token)
+        dataframe = ts.realtime_quote(ts_code="600519.SH", src="dc")
+        if dataframe is not None and not dataframe.empty:
+            return {"status": "ok", "message": "A股 / ETF 实时接口正常", "checkedAt": now_iso()}
+        return {"status": "error", "message": "未返回有效实时行情", "checkedAt": now_iso()}
+    except Exception as exc:
+        return {"status": "error", "message": f"Tushare 实时接口异常：{str(exc)[:120]}", "checkedAt": now_iso()}
+
+
+def check_tushare_fund_status(settings: sqlite3.Row) -> dict[str, str]:
+    token = settings["tushare_token"]
+    if not token:
+        return {"status": "warning", "message": "未填写 Tushare Token", "checkedAt": now_iso()}
+
+    try:
+        ts = import_tushare()
+        pro = ts.pro_api(token)
+        dataframe = pro.fund_nav(ts_code="000001.OF", market="O")
+        if dataframe is not None and not dataframe.empty:
+            return {"status": "ok", "message": "基金净值接口正常", "checkedAt": now_iso()}
+        return {"status": "error", "message": "未返回有效基金净值", "checkedAt": now_iso()}
+    except Exception as exc:
+        return {"status": "error", "message": f"Tushare 基金接口异常：{str(exc)[:120]}", "checkedAt": now_iso()}
+
+
+def check_binance_status() -> dict[str, str]:
+    last_error: Exception | None = None
+    for index, base_url in enumerate(BINANCE_PUBLIC_BASE_URLS):
+        try:
+            payload = read_json_url(f"{base_url}/api/v3/ticker/24hr?symbol=BTCUSDT")
+            if payload.get("lastPrice"):
+                source = "primary" if index == 0 else "fallback"
+                message = "接口正常" if index == 0 else "备用接口正常"
+                return {"status": "ok", "message": message, "source": source, "checkedAt": now_iso()}
+        except Exception as exc:
+            last_error = exc
+    return {"status": "error", "message": f"请求失败：{str(last_error)[:80]}", "source": "unknown", "checkedAt": now_iso()}
+
+
+def check_fx_status() -> dict[str, str]:
+    try:
+        result = fetch_fx_rates(["USD"], "CNY")
+        source_label = "主接口" if result["source"] == "primary" else "备用接口"
+        return {
+            "status": "ok",
+            "message": f"{source_label}正常",
+            "source": result["source"],
+            "checkedAt": now_iso(),
+        }
+    except Exception as exc:
+        return {"status": "error", "message": f"请求失败：{str(exc)[:80]}", "source": "unknown", "checkedAt": now_iso()}
+
+
+def _classify_tushare_status_error(error_text: str, *, fund_mode: bool) -> str:
+    lowered = error_text.lower()
+    network_keywords = (
+        "httpsconnectionpool",
+        "max retries exceeded",
+        "timed out",
+        "timeout",
+        "connection aborted",
+        "failed to establish a new connection",
+        "name or service not known",
+    )
+    if "没有接口访问权限" in error_text or "权限" in error_text:
+        return "基金接口无权限，请检查 Tushare 积分" if fund_mode else "实时接口无权限，请检查 Tushare Token"
+    if fund_mode and "doc_id=108" in lowered:
+        return "基金接口无权限，请检查 Tushare 积分"
+    if any(keyword in lowered for keyword in network_keywords):
+        return "基金接口连接失败，请稍后重试" if fund_mode else "实时接口连接失败，请稍后重试"
+    return "基金接口请求失败，请稍后重试" if fund_mode else "实时接口请求失败，请稍后重试"
+
+
+def check_tushare_realtime_status(settings: sqlite3.Row) -> dict[str, str]:
+    token = settings["tushare_token"]
+    if not token:
+        return {"status": "warning", "message": "未填写 Tushare Token", "checkedAt": now_iso()}
+
+    try:
+        ts = import_tushare()
+        ts.set_token(token)
+        dataframe = ts.realtime_quote(ts_code="600519.SH", src="dc")
+        if dataframe is not None and not dataframe.empty:
+            return {"status": "ok", "message": "A股 / ETF 实时接口正常", "checkedAt": now_iso()}
+        return {"status": "error", "message": "未返回有效实时行情", "checkedAt": now_iso()}
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": _classify_tushare_status_error(str(exc), fund_mode=False),
+            "checkedAt": now_iso(),
+        }
+
+
+def check_tushare_fund_status(settings: sqlite3.Row) -> dict[str, str]:
+    token = settings["tushare_token"]
+    if not token:
+        return {"status": "warning", "message": "未填写 Tushare Token", "checkedAt": now_iso()}
+
+    try:
+        ts = import_tushare()
+        pro = ts.pro_api(token)
+        dataframe = pro.fund_nav(ts_code="000001.OF", market="O")
+        if dataframe is not None and not dataframe.empty:
+            return {"status": "ok", "message": "基金净值接口正常", "checkedAt": now_iso()}
+        return {"status": "error", "message": "未返回有效基金净值", "checkedAt": now_iso()}
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": _classify_tushare_status_error(str(exc), fund_mode=True),
+            "checkedAt": now_iso(),
+        }
+
+
+def fetch_tushare_realtime_dataframe(ts: Any, ts_code: str):
+    last_error: Exception | None = None
+    for source in ("dc", "dc", "sina"):
+        try:
+            dataframe = ts.realtime_quote(ts_code=ts_code, src=source)
+            if dataframe is not None and not dataframe.empty:
+                return dataframe
+        except Exception as exc:
+            last_error = exc
+    if last_error is not None:
+        raise last_error
+    return None
+
+
+def resolve_tushare_realtime_quote(asset: AssetPayload, settings: sqlite3.Row) -> dict[str, Any]:
+    token = settings["tushare_token"]
+    if not token:
+        raise HTTPException(status_code=400, detail="请先在设置里填写 Tushare Token")
+
+    ts = import_tushare()
+    ts.set_token(token)
+    ts_code = normalize_cn_symbol(asset.symbol, asset.type, asset.platform)
+    dataframe = fetch_tushare_realtime_dataframe(ts, ts_code)
+    if dataframe is None or dataframe.empty:
+        raise HTTPException(status_code=404, detail=f"Tushare 未找到实时行情：{ts_code}")
+
+    row = dataframe.iloc[0]
+    return {
+        "currentPrice": read_series_value(row, "price", "close", "last"),
+        "previousClose": read_series_value(row, "pre_close", "prev_close"),
+        "normalizedSymbol": ts_code,
+        "quoteSource": "tushare",
+    }
+
+
+def check_tushare_realtime_status(settings: sqlite3.Row) -> dict[str, str]:
+    token = settings["tushare_token"]
+    if not token:
+        return {"status": "warning", "message": "未填写 Tushare Token", "checkedAt": now_iso()}
+
+    try:
+        ts = import_tushare()
+        ts.set_token(token)
+        dataframe = fetch_tushare_realtime_dataframe(ts, "600519.SH")
+        if dataframe is not None and not dataframe.empty:
+            return {"status": "ok", "message": "A股 / ETF 实时接口正常", "checkedAt": now_iso()}
+        return {"status": "error", "message": "未返回有效实时行情", "checkedAt": now_iso()}
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": _classify_tushare_status_error(str(exc), fund_mode=False),
+            "checkedAt": now_iso(),
+        }
+
+
+def normalize_fund_symbol(symbol: str) -> str:
+    cleaned = symbol.strip().upper()
+    if cleaned.endswith(".OF"):
+        return cleaned[:-3]
+    return cleaned
+
+
+def parse_eastmoney_fund_quote_html(html: str) -> tuple[float, float, str]:
+    text = re.sub(r"<[^>]+>", " ", html)
+    text = text.replace("&nbsp;", " ").replace("\u3000", " ").replace("\xa0", " ")
+    text = re.sub(r"\s+", " ", text)
+
+    current_match = re.search(r"单位净值\s*\(\s*\d{4}-\d{2}-\d{2}\s*\)\s*([0-9]+(?:\.[0-9]+)?)", text)
+    quote_date_match = re.search(r"单位净值\s*\(\s*(\d{4}-\d{2}-\d{2})\s*\)", text)
+    if not current_match:
+        current_match = re.search(r"单位净值\s*\(\s*\d{2}-\d{2}\s*\)\s*([0-9]+(?:\.[0-9]+)?)", text)
+    if not current_match:
+        raise ValueError("missing current nav")
+
+    history_matches = re.findall(
+        r"\d{2}-\d{2}\s+([0-9]+(?:\.[0-9]+)?)\s+[0-9]+(?:\.[0-9]+)?\s+[+-]?[0-9]+(?:\.[0-9]+)?%",
+        text,
+    )
+    current_price = float(current_match.group(1))
+    previous_close = float(history_matches[1]) if len(history_matches) > 1 else current_price
+    quote_date = quote_date_match.group(1) if quote_date_match else ""
+    return current_price, previous_close, quote_date
+
+
+def resolve_tushare_fund_quote(asset: AssetPayload, settings: sqlite3.Row) -> dict[str, Any]:
+    fund_code = normalize_fund_symbol(asset.symbol)
+    html = read_text_url(f"https://fund.eastmoney.com/{fund_code}.html")
+    current_price, previous_close, quote_date = parse_eastmoney_fund_quote_html(html)
+    return {
+        "currentPrice": current_price,
+        "previousClose": previous_close,
+        "normalizedSymbol": f"{fund_code}.OF",
+        "quoteSource": "fund_eastmoney",
+        "quoteDate": quote_date,
+    }
+
+
+def check_tushare_fund_status(settings: sqlite3.Row) -> dict[str, str]:
+    try:
+        html = read_text_url("https://fund.eastmoney.com/000001.html")
+        current_price, _, _ = parse_eastmoney_fund_quote_html(html)
+        if current_price > 0:
+            return {"status": "ok", "message": "场外基金净值接口正常", "checkedAt": now_iso()}
+        return {"status": "error", "message": "未返回有效基金净值", "checkedAt": now_iso()}
+    except Exception as exc:
+        lowered = str(exc).lower()
+        if any(
+            keyword in lowered
+            for keyword in (
+                "httpsconnectionpool",
+                "max retries exceeded",
+                "timed out",
+                "timeout",
+                "connection aborted",
+                "failed to establish a new connection",
+                "name or service not known",
+            )
+        ):
+            message = "基金接口连接失败，请稍后重试"
+        else:
+            message = "基金接口请求失败，请稍后重试"
+        return {"status": "error", "message": message, "checkedAt": now_iso()}
+
+
+@app.post("/api/auth/register")
+def register(payload: RegisterPayload, response: Response) -> dict[str, Any]:
+    username = payload.username.strip().lower()
+    if username == ADMIN_USERNAME:
+        raise HTTPException(status_code=403, detail="admin 账号仅供管理员使用")
+    if not username:
+        raise HTTPException(status_code=400, detail="用户名不能为空")
+
+    salt = secrets.token_hex(16)
+    password_hash = hash_password(payload.password, salt)
+
+    with closing(get_db()) as conn:
+        existing = conn.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=409, detail="用户名已存在")
+
+        cursor = conn.execute(
+            "INSERT INTO users (username, password_hash, password_salt, created_at) VALUES (?, ?, ?, ?)",
+            (username, password_hash, salt, now_iso()),
+        )
+        user_id = int(cursor.lastrowid)
+        conn.execute(
+            """
+            INSERT INTO user_settings (user_id, finnhub_key, tushare_token, auto_refresh_interval, last_sync_at)
+            VALUES (?, '', '', 0, '')
+            """,
+            (user_id,),
+        )
+        conn.commit()
+
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=create_session_token(user_id),
+        httponly=True,
+        samesite="lax",
+        max_age=SESSION_TTL_DAYS * 24 * 60 * 60,
+    )
+    return {"user": {"id": user_id, "username": username, "isAdmin": username == ADMIN_USERNAME}}
+
+
+@app.post("/api/auth/login")
+def login(payload: LoginPayload, response: Response) -> dict[str, Any]:
+    username = payload.username.strip().lower()
+    with closing(get_db()) as conn:
+        user = conn.execute(
+            "SELECT id, username, password_hash, password_salt, created_at FROM users WHERE username = ?",
+            (username,),
+        ).fetchone()
+    if not user:
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    password_hash = hash_password(payload.password, user["password_salt"])
+    if not hmac.compare_digest(password_hash, user["password_hash"]):
+        raise HTTPException(status_code=401, detail="用户名或密码错误")
+
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=create_session_token(int(user["id"])),
+        httponly=True,
+        samesite="lax",
+        max_age=SESSION_TTL_DAYS * 24 * 60 * 60,
+    )
+    return {"user": {"id": int(user["id"]), "username": user["username"], "createdAt": user["created_at"], "isAdmin": is_admin_user(user)}}
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response) -> dict[str, str]:
+    response.delete_cookie(SESSION_COOKIE)
+    return {"message": "ok"}
+
+
+@app.get("/api/auth/me")
+def me(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    return {"user": {"id": int(user["id"]), "username": user["username"], "createdAt": user["created_at"], "isAdmin": is_admin_user(user)}}
+
+
+@app.get("/api/assets")
+def list_assets(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, name, platform, type, symbol, quantity, cost_price, current_price,
+                   previous_close, currency, fx_rate, quote_source, quote_date, notes, updated_at
+            FROM assets
+            WHERE user_id = ?
+            ORDER BY updated_at DESC
+            """,
+            (user["id"],),
+        ).fetchall()
+
+    assets = [
+        {
+            "id": row["id"],
+            "name": row["name"],
+            "platform": row["platform"],
+            "type": row["type"],
+            "symbol": row["symbol"],
+            "quantity": row["quantity"],
+            "costPrice": row["cost_price"],
+            "currentPrice": row["current_price"],
+            "previousClose": row["previous_close"],
+            "currency": row["currency"],
+            "fxRate": row["fx_rate"],
+            "quoteSource": row["quote_source"],
+            "quoteDate": row["quote_date"],
+            "notes": row["notes"],
+            "updatedAt": row["updated_at"],
+        }
+        for row in rows
+    ]
+    return {"assets": assets}
+
+
+@app.post("/api/assets")
+def save_asset(payload: AssetPayload, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO assets (
+                id, user_id, name, platform, type, symbol, quantity, cost_price,
+                current_price, previous_close, currency, fx_rate, quote_source, quote_date, notes, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                user_id = excluded.user_id,
+                name = excluded.name,
+                platform = excluded.platform,
+                type = excluded.type,
+                symbol = excluded.symbol,
+                quantity = excluded.quantity,
+                cost_price = excluded.cost_price,
+                current_price = excluded.current_price,
+                previous_close = excluded.previous_close,
+                currency = excluded.currency,
+                fx_rate = excluded.fx_rate,
+                quote_source = excluded.quote_source,
+                quote_date = excluded.quote_date,
+                notes = excluded.notes,
+                updated_at = excluded.updated_at
+            """,
+            (
+                payload.id,
+                user["id"],
+                payload.name,
+                payload.platform,
+                payload.type,
+                payload.symbol,
+                payload.quantity,
+                payload.costPrice,
+                payload.currentPrice,
+                payload.previousClose,
+                payload.currency,
+                payload.fxRate,
+                payload.quoteSource,
+                payload.quoteDate,
+                payload.notes,
+                payload.updatedAt,
+            ),
+        )
+        conn.commit()
+    return {"asset": payload.model_dump()}
+
+
+@app.delete("/api/assets/{asset_id}")
+def delete_asset(asset_id: str, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, str]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM assets WHERE id = ? AND user_id = ?", (asset_id, user["id"]))
+        conn.commit()
+    return {"message": "ok"}
+
+
+@app.get("/api/settings")
+def get_settings(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        settings = get_shared_settings(conn)
+    return {
+        "settings": {
+            "finnhubKey": settings["finnhub_key"],
+            "tushareToken": settings["tushare_token"],
+            "autoRefreshInterval": settings["auto_refresh_interval"],
+            "lastSyncAt": settings["last_sync_at"],
+            "canEdit": is_admin_user(user),
+        }
+    }
+
+
+@app.put("/api/settings")
+def update_settings(payload: SettingsPayload, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    if not is_admin_user(user):
+        raise HTTPException(status_code=403, detail="只有管理员可以修改行情设置")
+    with closing(get_db()) as conn:
+        admin_user_id = get_admin_user_id(conn)
+        ensure_settings(conn, admin_user_id)
+        conn.execute(
+            """
+            UPDATE user_settings
+            SET finnhub_key = ?, tushare_token = ?, auto_refresh_interval = ?, last_sync_at = ?
+            WHERE user_id = ?
+            """,
+            (
+                payload.finnhubKey,
+                payload.tushareToken,
+                payload.autoRefreshInterval,
+                payload.lastSyncAt,
+                admin_user_id,
+            ),
+        )
+        conn.commit()
+    return {"settings": {**payload.model_dump(), "canEdit": True}}
+
+
+@app.get("/api/account-balances")
+def list_account_balances(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        rows = conn.execute(
+            """
+            SELECT platform, free_cash, display_currency, updated_at
+            FROM account_balances
+            WHERE user_id = ?
+            ORDER BY platform ASC
+            """,
+            (user["id"],),
+        ).fetchall()
+    return {
+        "accountBalances": [
+            {
+                "platform": row["platform"],
+                "freeCash": row["free_cash"],
+                "displayCurrency": row["display_currency"],
+                "updatedAt": row["updated_at"],
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.put("/api/account-balances")
+def save_account_balance(
+    payload: AccountBalancePayload,
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        conn.execute(
+            """
+            INSERT INTO account_balances (user_id, platform, free_cash, display_currency, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, platform) DO UPDATE SET
+                free_cash = excluded.free_cash,
+                display_currency = excluded.display_currency,
+                updated_at = excluded.updated_at
+            """,
+            (user["id"], payload.platform, payload.freeCash, payload.displayCurrency, payload.updatedAt),
+        )
+        conn.commit()
+    return {"accountBalance": payload.model_dump()}
+
+
+@app.delete("/api/account-balances")
+def clear_account_balances(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, str]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM account_balances WHERE user_id = ?", (user["id"],))
+        conn.commit()
+    return {"message": "ok"}
+
+
+@app.post("/api/quotes/resolve")
+def quote_resolve(payload: AssetPayload, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        settings = get_shared_settings(conn)
+    return {"quote": resolve_quote(payload, settings)}
+
+
+@app.get("/api/fx/rates")
+def fx_rates(currencies: str, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    get_current_user(session_cookie)
+    currency_list = [item.strip().upper() for item in currencies.split(",") if item.strip()]
+    if not currency_list:
+        raise HTTPException(status_code=400, detail="缺少汇率币种")
+    return fetch_fx_rates(currency_list, "CNY")
+
+
+@app.get("/api/providers/status")
+def provider_status(force: int = 0, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        settings = get_shared_settings(conn)
+    cache_key = (
+        "shared",
+        settings["finnhub_key"],
+        settings["tushare_token"],
+    )
+    now = time()
+    if not force and provider_status_cache["key"] == cache_key and provider_status_cache["expires_at"] > now:
+        return {"providers": provider_status_cache["providers"]}
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        finnhub_future = executor.submit(check_finnhub_status, settings)
+        tushare_realtime_future = executor.submit(check_tushare_realtime_status, settings)
+        tushare_fund_future = executor.submit(check_tushare_fund_status, settings)
+        binance_future = executor.submit(check_binance_status)
+        fx_future = executor.submit(check_fx_status)
+    providers = {
+        "finnhub": finnhub_future.result(),
+        "tushareRealtime": tushare_realtime_future.result(),
+        "tushareFund": tushare_fund_future.result(),
+        "binance": binance_future.result(),
+        "fx": fx_future.result(),
+    }
+    provider_status_cache["key"] = cache_key
+    provider_status_cache["expires_at"] = now + PROVIDER_STATUS_CACHE_TTL_SECONDS
+    provider_status_cache["providers"] = providers
+    return {
+        "providers": providers
+    }
+
+
+@app.get("/")
+def root() -> FileResponse:
+    return FileResponse(BASE_DIR / "index.html")
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+app.mount("/", StaticFiles(directory=BASE_DIR, html=True), name="static")
+
+
+def check_finnhub_status(settings: sqlite3.Row) -> dict[str, str]:
+    api_key = settings["finnhub_key"]
+    if not api_key:
+        return {"status": "warning", "message": "未填写 Finnhub API Key", "checkedAt": now_iso()}
+
+    try:
+        query = urlencode({"symbol": "AAPL", "token": api_key})
+        payload = read_json_url(f"https://finnhub.io/api/v1/quote?{query}")
+        if float(payload.get("c", 0) or 0) > 0:
+            return {"status": "ok", "message": "接口正常", "checkedAt": now_iso()}
+        if payload.get("error"):
+            return {"status": "error", "message": str(payload.get("error"))[:120], "checkedAt": now_iso()}
+        return {"status": "error", "message": "未返回有效报价", "checkedAt": now_iso()}
+    except Exception as exc:
+        return {"status": "error", "message": f"请求失败：{str(exc)[:120]}", "checkedAt": now_iso()}
