@@ -3,6 +3,8 @@ const tableBody = document.querySelector("#asset-table-body");
 const assetCardList = document.querySelector("#asset-card-list");
 const toast = document.querySelector("#toast");
 const authForm = document.querySelector("#auth-form");
+const PRICE_REFRESH_COOLDOWN_MS = 60 * 1000;
+const PRICE_REFRESH_COOLDOWN_KEY = "wealthtrack-price-refresh-last-at";
 
 const state = {
   user: null,
@@ -25,7 +27,8 @@ const state = {
     type: "all"
   },
   authMode: "login",
-  regionTouched: false
+  regionTouched: false,
+  refreshCooldownTimerId: null
 };
 
 init();
@@ -36,6 +39,7 @@ async function init() {
   syncSettingsAccess();
   resetForm();
   render();
+  updateRefreshPriceButtonCooldown();
   await bootstrapSession();
 }
 
@@ -1835,6 +1839,80 @@ function getProviderSourceLabel(source) {
   };
   return map[source] || source;
 }
+
+function getRefreshCooldownRemainingMs() {
+  try {
+    const lastAt = Number(window.localStorage.getItem(PRICE_REFRESH_COOLDOWN_KEY) || 0);
+    if (!lastAt) {
+      return 0;
+    }
+    return Math.max(0, PRICE_REFRESH_COOLDOWN_MS - (Date.now() - lastAt));
+  } catch {
+    return 0;
+  }
+}
+
+function startRefreshCooldown() {
+  try {
+    window.localStorage.setItem(PRICE_REFRESH_COOLDOWN_KEY, String(Date.now()));
+  } catch {
+    // ignore storage failures
+  }
+  updateRefreshPriceButtonCooldown();
+}
+
+function updateRefreshPriceButtonCooldown() {
+  const button = document.querySelector("#refresh-prices-btn");
+  if (!button) {
+    return;
+  }
+
+  const remainingMs = getRefreshCooldownRemainingMs();
+  const remainingSeconds = Math.ceil(remainingMs / 1000);
+  button.disabled = remainingMs > 0;
+  button.textContent = remainingMs > 0 ? `刷新实时价格 (${remainingSeconds}s)` : "刷新实时价格";
+
+  if (state.refreshCooldownTimerId) {
+    window.clearTimeout(state.refreshCooldownTimerId);
+    state.refreshCooldownTimerId = null;
+  }
+
+  if (remainingMs > 0) {
+    state.refreshCooldownTimerId = window.setTimeout(() => {
+      updateRefreshPriceButtonCooldown();
+    }, 1000);
+  }
+}
+
+const originalRefreshAllPrices = refreshAllPrices;
+refreshAllPrices = async function refreshAllPricesWithCooldown(...args) {
+  const cooldownRemaining = getRefreshCooldownRemainingMs();
+  if (cooldownRemaining > 0) {
+    updateRefreshPriceButtonCooldown();
+    showToast(`刷新过于频繁，请 ${Math.ceil(cooldownRemaining / 1000)} 秒后再试`);
+    return;
+  }
+  startRefreshCooldown();
+  try {
+    return await originalRefreshAllPrices(...args);
+  } finally {
+    updateRefreshPriceButtonCooldown();
+  }
+};
+
+function rebindRefreshPriceButton() {
+  const button = document.querySelector("#refresh-prices-btn");
+  if (!button || button.dataset.cooldownBound === "true") {
+    return;
+  }
+  const replacement = button.cloneNode(true);
+  replacement.dataset.cooldownBound = "true";
+  button.replaceWith(replacement);
+  replacement.addEventListener("click", refreshAllPrices);
+  updateRefreshPriceButtonCooldown();
+}
+
+rebindRefreshPriceButton();
 
 function getProviderCards(providers) {
   return [
