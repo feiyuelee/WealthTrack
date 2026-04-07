@@ -12,10 +12,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from time import time
+from time import sleep, time
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 from fastapi import Cookie, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,6 +38,7 @@ ADMIN_PASSWORD = "12345678"
 DEFAULT_FINNHUB_KEY = "d797klhr01qqpmhfoog0d797klhr01qqpmhfoogg"
 DEFAULT_TUSHARE_TOKEN = "25790f70139144b663e37f1806836ba2a55bf0adb90e4bfb9dd85873"
 BINANCE_PUBLIC_BASE_URLS = ["https://data-api.binance.vision", "https://api.binance.com"]
+BEIJING_TZ = ZoneInfo("Asia/Shanghai")
 
 
 def now_iso() -> str:
@@ -80,6 +82,9 @@ def ensure_asset_columns(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(assets)").fetchall()}
     if "quote_date" not in columns:
         conn.execute("ALTER TABLE assets ADD COLUMN quote_date TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+    if "quote_fetched_at" not in columns:
+        conn.execute("ALTER TABLE assets ADD COLUMN quote_fetched_at TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
 
@@ -150,6 +155,7 @@ def init_db() -> None:
                 fx_rate REAL NOT NULL DEFAULT 1,
                 quote_source TEXT NOT NULL,
                 quote_date TEXT NOT NULL DEFAULT '',
+                quote_fetched_at TEXT NOT NULL DEFAULT '',
                 notes TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
@@ -217,6 +223,29 @@ def read_json_url(url: str) -> Any:
     )
     with urlopen(request, timeout=20) as response:
         return json.load(response)
+
+
+def read_eastmoney_json_url(url: str) -> Any:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json,text/plain,*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": "https://quote.eastmoney.com/",
+        "Origin": "https://quote.eastmoney.com",
+        "Connection": "keep-alive",
+    }
+    last_error: Exception | None = None
+    for attempt in range(2):
+        try:
+            request = Request(url, headers=headers)
+            with urlopen(request, timeout=20) as response:
+                return json.load(response)
+        except Exception as exc:
+            last_error = exc
+            if attempt == 0:
+                sleep(0.35)
+    raise last_error if last_error else RuntimeError("Eastmoney request failed")
 
 
 def read_text_url(url: str) -> str:
@@ -299,6 +328,7 @@ class AssetPayload(BaseModel):
     fxRate: float = 1
     quoteSource: str
     quoteDate: str = ""
+    quoteFetchedAt: str = ""
     notes: str = ""
     updatedAt: str
 
@@ -431,6 +461,18 @@ def normalize_cn_symbol(symbol: str, asset_type: str, platform: str) -> str:
     return f"{cleaned}.SZ"
 
 
+def normalize_eastmoney_secid(symbol: str) -> tuple[str, str]:
+    normalized = symbol.strip().upper()
+    if "." not in normalized:
+        raise ValueError(f"Unsupported Eastmoney symbol: {symbol}")
+    code, market = normalized.split(".", 1)
+    market = market.upper()
+    market_map = {"SH": "1", "SZ": "0", "BJ": "0"}
+    if market not in market_map:
+        raise ValueError(f"Unsupported Eastmoney market: {market}")
+    return normalized, f"{market_map[market]}.{code}"
+
+
 def read_series_value(record: Any, *candidates: str) -> float:
     for key in candidates:
         for candidate in (key, key.lower(), key.upper()):
@@ -452,7 +494,7 @@ def to_quote_date(value: Any) -> str:
             timestamp = int(text)
             if timestamp > 10_000_000_000:
                 timestamp = timestamp / 1000
-            return datetime.fromtimestamp(timestamp, timezone.utc).date().isoformat()
+            return datetime.fromtimestamp(timestamp, BEIJING_TZ).date().isoformat()
         except Exception:
             return ""
     match = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", text)
@@ -460,6 +502,48 @@ def to_quote_date(value: Any) -> str:
         year, month, day = match.groups()
         return f"{int(year):04d}-{int(month):02d}-{int(day):02d}"
     return ""
+
+
+def scale_eastmoney_price(value: Any, precision: Any) -> float:
+    numeric = float(value or 0)
+    digits = int(precision or 2)
+    return numeric / (10 ** max(0, digits))
+
+
+def fetch_eastmoney_realtime_quote(symbol: str) -> dict[str, Any]:
+    normalized_symbol, secid = normalize_eastmoney_secid(symbol)
+    payload = read_eastmoney_json_url(
+        "https://push2.eastmoney.com/api/qt/stock/get?"
+        + urlencode(
+            {
+                "secid": secid,
+                "invt": "2",
+                "fltt": "2",
+                "fields": "f43,f57,f58,f59,f60,f86,f124",
+            }
+        )
+    )
+    data = payload.get("data") or {}
+    if not data:
+        raise ValueError(f"Eastmoney quote missing data: {normalized_symbol}")
+
+    precision = data.get("f59", 2)
+    current_price = scale_eastmoney_price(data.get("f43"), precision)
+    if current_price <= 0:
+        raise ValueError(f"Eastmoney quote missing current price: {normalized_symbol}")
+
+    previous_close = scale_eastmoney_price(data.get("f60"), precision)
+    quote_date = to_quote_date(data.get("f124"))
+    if not quote_date:
+        quote_date = datetime.now(BEIJING_TZ).date().isoformat()
+
+    return {
+        "currentPrice": current_price,
+        "previousClose": previous_close or current_price,
+        "normalizedSymbol": normalized_symbol,
+        "quoteSource": "tushare",
+        "quoteDate": quote_date,
+    }
 
 
 def read_series_date(record: Any, *candidates: str) -> str:
@@ -550,12 +634,17 @@ def resolve_tushare_realtime_quote(asset: AssetPayload, settings: sqlite3.Row) -
         raise HTTPException(status_code=404, detail=f"Tushare 未找到实时行情：{ts_code}")
 
     row = dataframe.iloc[0]
+    quote_date = read_series_date(row, "date", "trade_date")
+    if not quote_date:
+        # Some realtime sources return price fields without an explicit date.
+        # For A-share / ETF intraday quotes, treat the quote as today's Beijing trade date.
+        quote_date = datetime.now(BEIJING_TZ).date().isoformat()
     return {
         "currentPrice": read_series_value(row, "price", "close", "last"),
         "previousClose": read_series_value(row, "pre_close", "prev_close"),
         "normalizedSymbol": ts_code,
         "quoteSource": "tushare",
-        "quoteDate": read_series_date(row, "date", "trade_date"),
+        "quoteDate": quote_date,
     }
 
 
@@ -764,6 +853,32 @@ def fetch_tushare_realtime_dataframe(ts: Any, ts_code: str):
     return None
 
 
+def get_cn_equity_effective_quote_date(token: str) -> str:
+    now_bj = datetime.now(BEIJING_TZ)
+    reference_date = now_bj.date()
+    if (now_bj.hour, now_bj.minute) < (9, 30):
+        reference_date = reference_date - timedelta(days=1)
+
+    try:
+        ts = import_tushare()
+        pro = ts.pro_api(token)
+        start_date = (reference_date - timedelta(days=14)).strftime("%Y%m%d")
+        end_date = reference_date.strftime("%Y%m%d")
+        dataframe = pro.trade_cal(exchange="SSE", start_date=start_date, end_date=end_date)
+        if dataframe is not None and not dataframe.empty:
+            open_days = dataframe[dataframe["is_open"].astype(str) == "1"].sort_values("cal_date", ascending=False)
+            if not open_days.empty:
+                quote_date = to_quote_date(open_days.iloc[0]["cal_date"])
+                if quote_date:
+                    return quote_date
+    except Exception:
+        pass
+
+    while reference_date.weekday() >= 5:
+        reference_date = reference_date - timedelta(days=1)
+    return reference_date.isoformat()
+
+
 def resolve_tushare_realtime_quote(asset: AssetPayload, settings: sqlite3.Row) -> dict[str, Any]:
     token = settings["tushare_token"]
     if not token:
@@ -958,7 +1073,7 @@ def list_assets(session_cookie: str | None = Cookie(default=None, alias=SESSION_
         rows = conn.execute(
             """
             SELECT id, name, platform, type, symbol, quantity, cost_price, current_price,
-                   previous_close, currency, fx_rate, quote_source, quote_date, notes, updated_at
+                   previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
             FROM assets
             WHERE user_id = ?
             ORDER BY updated_at DESC
@@ -981,6 +1096,7 @@ def list_assets(session_cookie: str | None = Cookie(default=None, alias=SESSION_
             "fxRate": row["fx_rate"],
             "quoteSource": row["quote_source"],
             "quoteDate": row["quote_date"],
+            "quoteFetchedAt": row["quote_fetched_at"],
             "notes": row["notes"],
             "updatedAt": row["updated_at"],
         }
@@ -997,8 +1113,8 @@ def save_asset(payload: AssetPayload, session_cookie: str | None = Cookie(defaul
             """
             INSERT INTO assets (
                 id, user_id, name, platform, type, symbol, quantity, cost_price,
-                current_price, previous_close, currency, fx_rate, quote_source, quote_date, notes, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                current_price, previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 user_id = excluded.user_id,
                 name = excluded.name,
@@ -1013,6 +1129,7 @@ def save_asset(payload: AssetPayload, session_cookie: str | None = Cookie(defaul
                 fx_rate = excluded.fx_rate,
                 quote_source = excluded.quote_source,
                 quote_date = excluded.quote_date,
+                quote_fetched_at = excluded.quote_fetched_at,
                 notes = excluded.notes,
                 updated_at = excluded.updated_at
             """,
@@ -1031,6 +1148,7 @@ def save_asset(payload: AssetPayload, session_cookie: str | None = Cookie(defaul
                 payload.fxRate,
                 payload.quoteSource,
                 payload.quoteDate,
+                payload.quoteFetchedAt,
                 payload.notes,
                 payload.updatedAt,
             ),
@@ -1152,7 +1270,10 @@ def quote_resolve(payload: AssetPayload, session_cookie: str | None = Cookie(def
     get_current_user(session_cookie)
     with closing(get_db()) as conn:
         settings = get_shared_settings(conn)
-    return {"quote": resolve_quote(payload, settings)}
+    quote = resolve_quote(payload, settings)
+    if "quoteFetchedAt" not in quote or not quote["quoteFetchedAt"]:
+        quote["quoteFetchedAt"] = now_iso()
+    return {"quote": quote}
 
 
 @app.get("/api/fx/rates")
@@ -1226,3 +1347,44 @@ def check_finnhub_status(settings: sqlite3.Row) -> dict[str, str]:
         return {"status": "error", "message": "未返回有效报价", "checkedAt": now_iso()}
     except Exception as exc:
         return {"status": "error", "message": f"请求失败：{str(exc)[:120]}", "checkedAt": now_iso()}
+def resolve_tushare_realtime_quote(asset: AssetPayload, settings: sqlite3.Row) -> dict[str, Any]:
+    token = settings["tushare_token"]
+    if not token:
+        raise HTTPException(status_code=400, detail="请先在设置里填写 Tushare Token")
+
+    ts = import_tushare()
+    ts.set_token(token)
+    ts_code = normalize_cn_symbol(asset.symbol, asset.type, asset.platform)
+    dataframe = fetch_tushare_realtime_dataframe(ts, ts_code)
+    if dataframe is None or dataframe.empty:
+        raise HTTPException(status_code=404, detail=f"Tushare 未找到实时行情：{ts_code}")
+
+    row = dataframe.iloc[0]
+    quote_date = get_cn_equity_effective_quote_date(token)
+    return {
+        "currentPrice": read_series_value(row, "price", "close", "last"),
+        "previousClose": read_series_value(row, "pre_close", "prev_close"),
+        "normalizedSymbol": ts_code,
+        "quoteSource": "tushare",
+        "quoteDate": quote_date,
+    }
+
+
+def check_tushare_realtime_status(settings: sqlite3.Row) -> dict[str, str]:
+    token = settings["tushare_token"]
+    if not token:
+        return {"status": "warning", "message": "未填写 Tushare Token", "checkedAt": now_iso()}
+
+    try:
+        ts = import_tushare()
+        ts.set_token(token)
+        dataframe = fetch_tushare_realtime_dataframe(ts, "600519.SH")
+        if dataframe is not None and not dataframe.empty:
+            return {"status": "ok", "message": "A股 / ETF 实时接口正常", "checkedAt": now_iso()}
+        return {"status": "error", "message": "未返回有效实时行情", "checkedAt": now_iso()}
+    except Exception as exc:
+        return {
+            "status": "error",
+            "message": _classify_tushare_status_error(str(exc), fund_mode=False),
+            "checkedAt": now_iso(),
+        }

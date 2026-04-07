@@ -3,8 +3,7 @@ const tableBody = document.querySelector("#asset-table-body");
 const assetCardList = document.querySelector("#asset-card-list");
 const toast = document.querySelector("#toast");
 const authForm = document.querySelector("#auth-form");
-const PRICE_REFRESH_COOLDOWN_MS = 60 * 1000;
-const PRICE_REFRESH_COOLDOWN_KEY = "wealthtrack-price-refresh-last-at";
+const BEIJING_TIME_ZONE = "Asia/Shanghai";
 
 const state = {
   user: null,
@@ -28,7 +27,7 @@ const state = {
   },
   authMode: "login",
   regionTouched: false,
-  refreshCooldownTimerId: null
+  isRefreshingPrices: false
 };
 
 init();
@@ -39,17 +38,54 @@ async function init() {
   syncSettingsAccess();
   resetForm();
   render();
-  updateRefreshPriceButtonCooldown();
   await bootstrapSession();
 }
 
 function mountCompactCurrencyControl() {
+  const heroCard = document.querySelector(".hero-card");
+  const top = document.querySelector(".hero-card .hero-card__top");
   const container = document.querySelector(".hero-card .inline-meta");
   const badge = document.querySelector("#display-currency-badge");
+  const lastSyncLabel = document.querySelector("#last-sync-label");
+  const note = document.querySelector(".hero-card .hero-card__note");
   const sidebarSelect = document.querySelector("#display-currency");
-  if (!container || !badge || !sidebarSelect || document.querySelector("#display-currency-compact")) {
+  if (!heroCard || !top || !container || !badge || !lastSyncLabel || !note || !sidebarSelect || document.querySelector("#display-currency-compact")) {
     return;
   }
+
+  let headline = top.querySelector(".hero-card__headline");
+  if (!headline) {
+    headline = document.createElement("div");
+    headline.className = "hero-card__headline";
+    top.prepend(headline);
+  }
+  headline.append(note);
+  headline.append(container);
+
+  let statusGroup = top.querySelector(".hero-card__status");
+  if (!statusGroup) {
+    statusGroup = document.createElement("div");
+    statusGroup.className = "hero-card__status";
+    const titleNode = top.firstElementChild;
+    if (titleNode && titleNode !== container) {
+      statusGroup.append(titleNode);
+    } else {
+      const fallbackTitle = document.createElement("span");
+      fallbackTitle.textContent = "最近刷新";
+      statusGroup.append(fallbackTitle);
+    }
+    top.append(statusGroup);
+  }
+  statusGroup.append(lastSyncLabel);
+
+  let statusLabel = statusGroup.querySelector(".hero-card__status-label");
+  if (!statusLabel) {
+    statusLabel = document.createElement("span");
+    statusLabel.className = "hero-card__status-label";
+  }
+  statusLabel.textContent = "最近刷新";
+  statusGroup.replaceChildren(statusLabel, lastSyncLabel);
+  top.replaceChildren(headline, statusGroup);
 
   const wrapper = document.createElement("div");
   wrapper.className = "currency-switch currency-switch--pill";
@@ -63,13 +99,43 @@ function mountCompactCurrencyControl() {
     </label>
   `;
   badge.replaceWith(wrapper);
+  wrapper.innerHTML = `
+    <button id="display-currency-compact-toggle" type="button" class="currency-switch__toggle" aria-label="切换显示币种">
+      <span class="currency-switch__icon" aria-hidden="true">¥</span>
+      <span class="currency-switch__label">CNY</span>
+    </button>
+  `;
 
-  const compactSelect = wrapper.querySelector("#display-currency-compact");
-  compactSelect.value = sidebarSelect.value;
-  compactSelect.addEventListener("change", () => {
-    sidebarSelect.value = compactSelect.value;
+  const compactSelect = wrapper.querySelector("#display-currency-compact-toggle");
+  compactSelect.addEventListener("click", () => {
+    sidebarSelect.value = sidebarSelect.value === "USD" ? "CNY" : "USD";
     sidebarSelect.dispatchEvent(new Event("change", { bubbles: true }));
   });
+
+  wrapper.innerHTML = `
+    <div id="display-currency-compact-toggle" class="currency-switch__segmented" role="group" aria-label="切换显示币种">
+      <button type="button" class="currency-switch__option" data-currency="CNY" aria-pressed="true" aria-label="切换为人民币显示">
+        <span class="currency-switch__icon" aria-hidden="true">¥</span>
+      </button>
+      <button type="button" class="currency-switch__option" data-currency="USD" aria-pressed="false" aria-label="切换为美元显示">
+        <span class="currency-switch__icon" aria-hidden="true">$</span>
+      </button>
+    </div>
+  `;
+  wrapper.querySelectorAll(".currency-switch__option").forEach((button) => {
+    button.addEventListener("click", () => {
+      const nextCurrency = button.dataset.currency;
+      if (!nextCurrency || nextCurrency === sidebarSelect.value) {
+        return;
+      }
+      sidebarSelect.value = nextCurrency;
+      sidebarSelect.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  });
+
+  headline.replaceChildren(note, wrapper, statusGroup);
+  top.replaceChildren(headline);
+
 }
 
 function bindEvents() {
@@ -82,7 +148,6 @@ function bindEvents() {
     document.querySelector("#import-assets-file").click();
   });
   document.querySelector("#import-assets-file").addEventListener("change", handleImportAssets);
-  document.querySelector("#refresh-prices-btn").addEventListener("click", refreshAllPrices);
   document.querySelector("#save-settings-button").addEventListener("click", saveSettings);
   document.querySelector("#refresh-provider-status-button").addEventListener("click", () => {
     refreshProviderStatuses({ force: true });
@@ -163,6 +228,12 @@ async function loadServerData() {
     // ignore display rate bootstrap failures
   }
 
+  try {
+    await refreshAllPrices({ bypassCooldown: true, silent: true, suppressEmptyToast: true });
+  } catch (error) {
+    console.error("Initial quote refresh failed", error);
+  }
+
   render();
 }
 
@@ -180,9 +251,18 @@ function render() {
 
 function renderDisplayCurrencyBadges() {
   const label = state.displayCurrency || "CNY";
-  const compactSelect = document.querySelector("#display-currency-compact");
-  if (compactSelect && compactSelect.value !== label) {
-    compactSelect.value = label;
+  const compactToggle = document.querySelector("#display-currency-compact-toggle");
+  if (compactToggle) {
+    compactToggle.dataset.currency = label;
+    compactToggle.setAttribute("aria-label", label === "USD" ? "切换为人民币显示" : "切换为美元显示");
+    const icon = compactToggle.querySelector(".currency-switch__icon");
+    const text = compactToggle.querySelector(".currency-switch__label");
+    if (icon) {
+      icon.textContent = label === "USD" ? "$" : "¥";
+    }
+    if (text) {
+      text.textContent = label;
+    }
   }
   const accountOverviewCurrency = document.querySelector("#account-overview-currency");
   if (accountOverviewCurrency && accountOverviewCurrency.value !== state.accountOverviewCurrency) {
@@ -228,9 +308,6 @@ function renderSummary(assets) {
   const dailyProfitRate = base > 0 ? (summary.dailyProfit / base) * 100 : 0;
 
   setText("#total-assets", formatCurrency(summary.totalAssets));
-  setText("#total-cost", formatCurrency(summary.totalCost));
-  setText("#total-profit", formatCurrency(summary.totalProfit));
-  setText("#total-profit-rate", `${formatSignedNumber(profitRate)}%`);
   setText("#daily-profit", formatCurrency(summary.dailyProfit));
   setText("#total-margin", formatCurrency(totalMargin));
   setText("#total-cash-balance", formatCurrency(totalCashBalance));
@@ -238,7 +315,6 @@ function renderSummary(assets) {
   setText("#hero-daily-profit-rate", `${formatSignedNumber(dailyProfitRate)}%`);
   setText("#hero-total-profit-rate", `${formatSignedNumber(profitRate)}%`);
 
-  applyNumberTone(document.querySelector("#total-profit"), summary.totalProfit);
   applyNumberTone(document.querySelector("#daily-profit"), summary.dailyProfit);
   applyNumberTone(document.querySelector("#total-margin"), -totalMargin);
   applyNumberTone(document.querySelector("#total-cash-balance"), totalCashBalance);
@@ -410,6 +486,7 @@ async function handleSubmit(event) {
     fxRate: Number(formData.get("fxRate")) || 1,
     quoteSource: String(formData.get("quoteSource")),
     quoteDate: latestPriceField?.dataset.quoteDate || existingAsset?.quoteDate || "",
+    quoteFetchedAt: latestPriceField?.dataset.quoteFetchedAt || existingAsset?.quoteFetchedAt || "",
     notes: String(formData.get("notes")).trim(),
     updatedAt: new Date().toISOString()
   };
@@ -672,6 +749,7 @@ function normalizeImportedAsset(rawAsset) {
     fxRate: Number(rawAsset.fxRate) || 1,
     quoteSource,
     quoteDate: String(rawAsset.quoteDate || "").trim(),
+    quoteFetchedAt: String(rawAsset.quoteFetchedAt || "").trim(),
     notes: String(rawAsset.notes || "").trim(),
     updatedAt: rawAsset.updatedAt || new Date().toISOString()
   };
@@ -712,14 +790,23 @@ async function saveSettings() {
   showToast("设置已保存");
 }
 
-async function refreshAllPrices() {
+async function refreshAllPrices(options = {}) {
+  const { silent = false, suppressEmptyToast = false } = options;
   if (!ensureLoggedIn()) {
     return;
   }
+  if (state.isRefreshingPrices) {
+    return;
+  }
   if (!state.assets.length) {
+    if (suppressEmptyToast) {
+      return;
+    }
     showToast("请先录入资产");
     return;
   }
+
+  state.isRefreshingPrices = true;
 
   let successCount = 0;
   let failureCount = 0;
@@ -742,7 +829,8 @@ async function refreshAllPrices() {
       asset.previousClose = quote.previousClose ?? asset.previousClose;
       asset.symbol = quote.normalizedSymbol || asset.symbol;
       asset.quoteSource = quote.quoteSource || asset.quoteSource;
-      asset.quoteDate = quote.quoteDate || asset.quoteDate || "";
+      asset.quoteDate = Object.prototype.hasOwnProperty.call(quote, "quoteDate") ? (quote.quoteDate || "") : "";
+      asset.quoteFetchedAt = quote.quoteFetchedAt || new Date().toISOString();
       asset.updatedAt = new Date().toISOString();
 
       await apiFetch("/api/assets", {
@@ -756,14 +844,19 @@ async function refreshAllPrices() {
     }
   }
 
-  state.settings.lastSyncAt = new Date().toISOString();
-  await apiFetch("/api/settings", {
-    method: "PUT",
-    body: JSON.stringify(state.settings)
-  });
+  try {
+    const assetsResponse = await apiFetch("/api/assets");
+    state.assets = assetsResponse.assets;
+  } catch (error) {
+    console.error("Failed to reload refreshed assets", error);
+  }
 
   updateLastSyncLabel(state.settings.lastSyncAt);
   render();
+
+  if (silent) {
+    return;
+  }
 
   if (successCount && !failureCount) {
     showToast(`已刷新 ${successCount} 项价格`);
@@ -842,10 +935,7 @@ async function ensureDisplayCurrencyRate() {
 
 async function handleDisplayCurrencyChange(event) {
   state.displayCurrency = event.target.value;
-  const compactSelect = document.querySelector("#display-currency-compact");
-  if (compactSelect && compactSelect.value !== state.displayCurrency) {
-    compactSelect.value = state.displayCurrency;
-  }
+  const compactSelect = document.querySelector("#display-currency-compact-toggle");
   if (state.displayCurrency === "USD") {
     try {
       await ensureDisplayCurrencyRate();
@@ -853,6 +943,9 @@ async function handleDisplayCurrencyChange(event) {
       showToast(error.message || "获取美元汇率失败");
       state.displayCurrency = "CNY";
       event.target.value = "CNY";
+      if (compactSelect) {
+        compactSelect.dataset.currency = "CNY";
+      }
     }
   }
   render();
@@ -899,6 +992,7 @@ async function autoFillLatestPrice() {
     fxRate: Number(document.querySelector("#asset-fx-rate").value) || 1,
     quoteSource: source,
     quoteDate: priceField.dataset.quoteDate || "",
+    quoteFetchedAt: priceField.dataset.quoteFetchedAt || "",
     notes: document.querySelector("#asset-notes").value.trim(),
     updatedAt: new Date().toISOString()
   };
@@ -919,6 +1013,7 @@ async function autoFillLatestPrice() {
       prevCloseField.value = String(quote.previousClose);
     }
     priceField.dataset.quoteDate = quote.quoteDate || "";
+    priceField.dataset.quoteFetchedAt = quote.quoteFetchedAt || "";
     hintElement.textContent = `已自动获取最新单价：${formatUnitPrice(quote.currentPrice, source, currency)}`;
   } catch (error) {
     hintElement.classList.add("field-hint-error");
@@ -938,6 +1033,7 @@ function fillForm(asset) {
   document.querySelector("#asset-cost").value = asset.costPrice;
   document.querySelector("#asset-price").value = asset.currentPrice || "";
   document.querySelector("#asset-price").dataset.quoteDate = asset.quoteDate || "";
+  document.querySelector("#asset-price").dataset.quoteFetchedAt = asset.quoteFetchedAt || "";
   document.querySelector("#asset-prev-close").value = asset.previousClose || "";
   document.querySelector("#asset-currency").value = asset.currency;
   document.querySelector("#asset-fx-rate").value = asset.fxRate;
@@ -952,6 +1048,7 @@ function resetForm() {
   form.reset();
   document.querySelector("#asset-id").value = "";
   document.querySelector("#asset-price").dataset.quoteDate = "";
+  document.querySelector("#asset-price").dataset.quoteFetchedAt = "";
   document.querySelector("#asset-platform").value = "alipay";
   document.querySelector("#asset-source-select").value = "fund_eastmoney";
   document.querySelector("#asset-type").value = "fund";
@@ -1233,7 +1330,7 @@ function hydrateSettings() {
   document.querySelector("#tushare-token").value = state.settings.tushareToken || "";
   document.querySelector("#auto-refresh-interval").value = String(state.settings.autoRefreshInterval || 0);
   document.querySelector("#display-currency").value = state.displayCurrency;
-  updateLastSyncLabel(state.settings.lastSyncAt);
+  updateLastSyncLabel();
   renderProviderStatusLoading();
   syncSettingsAccess();
 }
@@ -1322,11 +1419,16 @@ function getDailyProfit(asset) {
 }
 
 function getTodayDateString() {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-  return `${year}-${month}-${day}`;
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BEIJING_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(new Date());
+  const year = parts.find((part) => part.type === "year")?.value || "";
+  const month = parts.find((part) => part.type === "month")?.value || "";
+  const day = parts.find((part) => part.type === "day")?.value || "";
+  return year && month && day ? `${year}-${month}-${day}` : "";
 }
 
 function normalizeQuoteDate(value) {
@@ -1342,13 +1444,83 @@ function normalizeQuoteDate(value) {
   return `${year}-${month.padStart(2, "0")}-${day.padStart(2, "0")}`;
 }
 
+function addDaysToDateString(dateText, days) {
+  const normalized = normalizeQuoteDate(dateText);
+  if (!normalized) {
+    return "";
+  }
+  const [year, month, day] = normalized.split("-").map((part) => Number(part));
+  const date = new Date(Date.UTC(year, month - 1, day));
+  date.setUTCDate(date.getUTCDate() + days);
+  const nextYear = String(date.getUTCFullYear());
+  const nextMonth = String(date.getUTCMonth() + 1).padStart(2, "0");
+  const nextDay = String(date.getUTCDate()).padStart(2, "0");
+  return `${nextYear}-${nextMonth}-${nextDay}`;
+}
+
+function getBeijingDateString(value) {
+  const date = value ? new Date(value) : new Date();
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: BEIJING_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  }).formatToParts(date);
+  const year = parts.find((part) => part.type === "year")?.value || "";
+  const month = parts.find((part) => part.type === "month")?.value || "";
+  const day = parts.find((part) => part.type === "day")?.value || "";
+  return year && month && day ? `${year}-${month}-${day}` : "";
+}
+
+function getEffectiveQuoteDate(asset) {
+  const normalized = normalizeQuoteDate(asset?.quoteDate);
+  if (!normalized) {
+    return "";
+  }
+  const platform = String(asset?.platform || "").toLowerCase();
+  const quoteSource = String(asset?.quoteSource || "").toLowerCase();
+  if (!["ibkr", "schwab"].includes(platform) || quoteSource !== "finnhub") {
+    return normalized;
+  }
+  const updatedDate = getBeijingDateString(asset?.updatedAt);
+  if (updatedDate && addDaysToDateString(normalized, 1) === updatedDate) {
+    return updatedDate;
+  }
+  return normalized;
+}
+
 function isAssetQuoteToday(asset) {
-  return normalizeQuoteDate(asset?.quoteDate) === getTodayDateString();
+  return getEffectiveQuoteDate(asset) === getTodayDateString();
 }
 
 function getAssetQuoteDateText(asset) {
-  const normalized = normalizeQuoteDate(asset?.quoteDate);
+  const normalized = getEffectiveQuoteDate(asset);
   return normalized || "未知日期";
+}
+
+function getLatestAssetQuoteFetchedAt() {
+  let latest = "";
+  for (const asset of state.assets) {
+    const fetchedAt = String(asset?.quoteFetchedAt || "").trim();
+    if (fetchedAt && (!latest || fetchedAt > latest)) {
+      latest = fetchedAt;
+    }
+  }
+  return latest;
+}
+
+function getLatestAssetQuoteDate() {
+  let latest = "";
+  for (const asset of state.assets) {
+    const quoteDate = getEffectiveQuoteDate(asset);
+    if (quoteDate && (!latest || quoteDate > latest)) {
+      latest = quoteDate;
+    }
+  }
+  return latest;
 }
 
 function handleAuthModeChange(event) {
@@ -1840,6 +2012,38 @@ function getProviderSourceLabel(source) {
   return map[source] || source;
 }
 
+updateLastSyncLabel = function updateLastSyncLabelFromQuotes() {
+  const latestQuoteFetchedAt = getLatestAssetQuoteFetchedAt();
+  const formattedFetchedAt = formatPreciseDateTime(latestQuoteFetchedAt);
+  if (formattedFetchedAt) {
+    setText("#last-sync-label", formattedFetchedAt);
+    return;
+  }
+  const latestQuoteDate = getLatestAssetQuoteDate();
+  if (latestQuoteDate) {
+    setText("#last-sync-label", latestQuoteDate);
+    return;
+  }
+  setText("#last-sync-label", "暂无报价更新");
+};
+
+renderDisplayCurrencyBadges = function renderDisplayCurrencyBadgesSegmented() {
+  const label = state.displayCurrency || "CNY";
+  const compactToggle = document.querySelector("#display-currency-compact-toggle");
+  if (compactToggle) {
+    compactToggle.setAttribute("aria-label", label === "USD" ? "切换为人民币显示" : "切换为美元显示");
+    compactToggle.querySelectorAll(".currency-switch__option").forEach((button) => {
+      const isActive = button.dataset.currency === label;
+      button.dataset.active = isActive ? "true" : "false";
+      button.setAttribute("aria-pressed", isActive ? "true" : "false");
+    });
+  }
+  const accountOverviewCurrency = document.querySelector("#account-overview-currency");
+  if (accountOverviewCurrency && accountOverviewCurrency.value !== state.accountOverviewCurrency) {
+    accountOverviewCurrency.value = state.accountOverviewCurrency;
+  }
+};
+
 function getRefreshCooldownRemainingMs() {
   try {
     const lastAt = Number(window.localStorage.getItem(PRICE_REFRESH_COOLDOWN_KEY) || 0);
@@ -1886,6 +2090,10 @@ function updateRefreshPriceButtonCooldown() {
 
 const originalRefreshAllPrices = refreshAllPrices;
 refreshAllPrices = async function refreshAllPricesWithCooldown(...args) {
+  const [options = {}] = args;
+  if (options && typeof options === "object" && options.bypassCooldown) {
+    return await originalRefreshAllPrices(...args);
+  }
   const cooldownRemaining = getRefreshCooldownRemainingMs();
   if (cooldownRemaining > 0) {
     updateRefreshPriceButtonCooldown();
@@ -1913,6 +2121,19 @@ function rebindRefreshPriceButton() {
 }
 
 rebindRefreshPriceButton();
+
+refreshAllPrices = async function refreshAllPricesWithoutButton(...args) {
+  return await originalRefreshAllPrices(...args);
+};
+
+const unlockedRefreshAllPrices = refreshAllPrices;
+refreshAllPrices = async function refreshAllPricesWithLock(...args) {
+  try {
+    return await unlockedRefreshAllPrices(...args);
+  } finally {
+    state.isRefreshingPrices = false;
+  }
+};
 
 function getProviderCards(providers) {
   return [
@@ -2837,7 +3058,7 @@ function buildHomepagePlatformProfitRows(assets) {
         hasNonTodayData: false
       };
     }
-    const quoteDate = normalizeQuoteDate(asset.quoteDate);
+    const quoteDate = getEffectiveQuoteDate(asset);
     if (quoteDate) {
       if (!groups[platform].latestQuoteDate || quoteDate > groups[platform].latestQuoteDate) {
         groups[platform].latestQuoteDate = quoteDate;
@@ -2939,6 +3160,55 @@ function setText(selector, value) {
 
 function updateLastSyncLabel(value) {
   setText("#last-sync-label", value ? `更新于 ${new Date(value).toLocaleString("zh-CN")}` : "未刷新");
+}
+
+function updateLastSyncLabel(value) {
+  const latestQuoteDate = getLatestAssetQuoteDate();
+  if (latestQuoteDate) {
+    setText("#last-sync-label", `报价至 ${latestQuoteDate}`);
+    return;
+  }
+  if (value) {
+    setText("#last-sync-label", `刷新于 ${new Date(value).toLocaleString("zh-CN")}`);
+    return;
+  }
+  setText("#last-sync-label", "暂无报价更新");
+}
+
+function formatPreciseDateTime(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "";
+  }
+  return date.toLocaleString("zh-CN", {
+    hour12: false,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit"
+  });
+}
+
+function updateLastSyncLabel(value) {
+  const latestQuoteFetchedAt = getLatestAssetQuoteFetchedAt();
+  const formattedFetchedAt = formatPreciseDateTime(latestQuoteFetchedAt);
+  if (formattedFetchedAt) {
+    setText("#last-sync-label", formattedFetchedAt);
+    return;
+  }
+  const latestQuoteDate = getLatestAssetQuoteDate();
+  if (latestQuoteDate) {
+    setText("#last-sync-label", `报价至 ${latestQuoteDate}`);
+    return;
+  }
+  const formattedSyncAt = formatPreciseDateTime(value);
+  if (formattedSyncAt) {
+    setText("#last-sync-label", `刷新于 ${formattedSyncAt}`);
+    return;
+  }
+  setText("#last-sync-label", "暂无报价更新");
 }
 
 function showToast(message) {

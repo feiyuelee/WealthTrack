@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="./styles.css?v=20260406-2">
+  <link rel="stylesheet" href="./styles.css?v=20260408-6">
 </head>
 <body>
   <div class="app-shell">
@@ -130,7 +130,6 @@
               <h2>账户总览</h2>
             </div>
             <span id="display-currency-badge-summary" class="display-currency-badge">CNY</span>
-            <button id="refresh-prices-btn" class="ghost-button">刷新实时价格</button>
           </div>
           <div id="dashboard-risk-banner" class="risk-banner hidden"></div>
           <div class="stats-grid">
@@ -138,16 +137,6 @@
               <span>净资产</span>
               <strong id="total-assets">¥0.00</strong>
               <small>资产减去负债后的总额</small>
-            </article>
-            <article class="stat-card">
-              <span>总成本</span>
-              <strong id="total-cost">¥0.00</strong>
-              <small>买入成本与负债本金合计</small>
-            </article>
-            <article class="stat-card">
-              <span>累计收益</span>
-              <strong id="total-profit">¥0.00</strong>
-              <small id="total-profit-rate">0.00%</small>
             </article>
             <article class="stat-card">
               <span>今日收益</span>
@@ -489,6 +478,6 @@
 
   <div id="toast" class="toast" aria-live="polite"></div>
 
-  <script src="./app.js?v=20260406-2"></script>
+    <script src="./app.js?v=20260408-15"></script>
 </body>
 </html>
