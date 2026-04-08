@@ -4,6 +4,7 @@ const assetCardList = document.querySelector("#asset-card-list");
 const toast = document.querySelector("#toast");
 const authForm = document.querySelector("#auth-form");
 const BEIJING_TIME_ZONE = "Asia/Shanghai";
+const NEW_YORK_TIME_ZONE = "America/New_York";
 
 const state = {
   user: null,
@@ -27,7 +28,8 @@ const state = {
   },
   authMode: "login",
   regionTouched: false,
-  isRefreshingPrices: false
+  isRefreshingPrices: false,
+  accountValuesVisible: false
 };
 
 init();
@@ -170,6 +172,10 @@ function bindEvents() {
   if (accountOverviewCurrency) {
     accountOverviewCurrency.addEventListener("change", handleAccountOverviewCurrencyChange);
   }
+  const accountPrivacyToggle = document.querySelector("#account-privacy-toggle");
+  if (accountPrivacyToggle) {
+    accountPrivacyToggle.addEventListener("click", toggleAccountValuesVisibility);
+  }
   document.querySelector("#asset-type-filter").addEventListener("change", handleFilterChange);
   document.querySelector("#clear-filter-btn").addEventListener("click", clearFilters);
 
@@ -239,6 +245,7 @@ async function loadServerData() {
 
 function render() {
   const filteredAssets = getFilteredAssets();
+  renderAccountPrivacyToggle();
   renderDisplayCurrencyBadges();
   renderSummary(filteredAssets);
   renderHomepageAssetDistribution(filteredAssets);
@@ -307,10 +314,10 @@ function renderSummary(assets) {
   const profitRate = base > 0 ? (summary.totalProfit / base) * 100 : 0;
   const dailyProfitRate = base > 0 ? (summary.dailyProfit / base) * 100 : 0;
 
-  setText("#total-assets", formatCurrency(summary.totalAssets));
-  setText("#daily-profit", formatCurrency(summary.dailyProfit));
-  setText("#total-margin", formatCurrency(totalMargin));
-  setText("#total-cash-balance", formatCurrency(totalCashBalance));
+  setText("#total-assets", getMaskedSensitiveText(formatCurrency(summary.totalAssets)));
+  setText("#daily-profit", getMaskedSensitiveText(formatCurrency(summary.dailyProfit)));
+  setText("#total-margin", getMaskedSensitiveText(formatCurrency(totalMargin)));
+  setText("#total-cash-balance", getMaskedSensitiveText(formatCurrency(totalCashBalance)));
   setText("#hero-daily-profit-main", formatCurrency(summary.dailyProfit));
   setText("#hero-daily-profit-rate", `${formatSignedNumber(dailyProfitRate)}%`);
   setText("#hero-total-profit-rate", `${formatSignedNumber(profitRate)}%`);
@@ -817,38 +824,17 @@ async function refreshAllPrices(options = {}) {
     console.error("FX refresh failed", error);
   }
 
-  for (const asset of state.assets) {
-    try {
-      const response = await apiFetch("/api/quotes/resolve", {
-        method: "POST",
-        body: JSON.stringify(asset)
-      });
-
-      const quote = response.quote;
-      asset.currentPrice = quote.currentPrice ?? asset.currentPrice;
-      asset.previousClose = quote.previousClose ?? asset.previousClose;
-      asset.symbol = quote.normalizedSymbol || asset.symbol;
-      asset.quoteSource = quote.quoteSource || asset.quoteSource;
-      asset.quoteDate = Object.prototype.hasOwnProperty.call(quote, "quoteDate") ? (quote.quoteDate || "") : "";
-      asset.quoteFetchedAt = quote.quoteFetchedAt || new Date().toISOString();
-      asset.updatedAt = new Date().toISOString();
-
-      await apiFetch("/api/assets", {
-        method: "POST",
-        body: JSON.stringify(asset)
-      });
-      successCount += 1;
-    } catch (error) {
-      console.error(`Failed to refresh ${asset.symbol}`, error);
-      failureCount += 1;
-    }
-  }
-
   try {
-    const assetsResponse = await apiFetch("/api/assets");
-    state.assets = assetsResponse.assets;
+    const response = await apiFetch("/api/quotes/refresh", {
+      method: "POST",
+      body: JSON.stringify({ assets: state.assets })
+    });
+    state.assets = response.assets || state.assets;
+    successCount = Number(response.successCount) || 0;
+    failureCount = Number(response.failureCount) || 0;
   } catch (error) {
-    console.error("Failed to reload refreshed assets", error);
+    console.error("Failed to refresh assets in batch", error);
+    failureCount = state.assets.length;
   }
 
   updateLastSyncLabel(state.settings.lastSyncAt);
@@ -1409,7 +1395,14 @@ function getDailyProfit(asset) {
   if (asset.type === "cash" || asset.type === "liability") {
     return 0;
   }
-  if (!isAssetQuoteToday(asset)) {
+  if (!shouldCountAssetForDailyProfit(asset)) {
+    return 0;
+  }
+  return getQuoteProfitValue(asset);
+}
+
+function getQuoteProfitValue(asset) {
+  if (asset.type === "cash" || asset.type === "liability") {
     return 0;
   }
   if (!asset.previousClose || !asset.currentPrice) {
@@ -1429,6 +1422,50 @@ function getTodayDateString() {
   const month = parts.find((part) => part.type === "month")?.value || "";
   const day = parts.find((part) => part.type === "day")?.value || "";
   return year && month && day ? `${year}-${month}-${day}` : "";
+}
+
+function isUsEquityPlatform(platform) {
+  return ["ibkr", "schwab"].includes(String(platform || "").toLowerCase());
+}
+
+function getUsMarketSessionInfo(value = new Date()) {
+  const formatter = new Intl.DateTimeFormat("en-US", {
+    timeZone: NEW_YORK_TIME_ZONE,
+    weekday: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false
+  });
+  const parts = formatter.formatToParts(value);
+  const weekday = parts.find((part) => part.type === "weekday")?.value || "";
+  const hour = Number(parts.find((part) => part.type === "hour")?.value || 0);
+  const minute = Number(parts.find((part) => part.type === "minute")?.value || 0);
+  const totalMinutes = hour * 60 + minute;
+  const isWeekend = weekday === "Sat" || weekday === "Sun";
+  if (isWeekend) {
+    return { label: "休市", badgeClass: "freshness-badge--yesterday", zeroProfit: true };
+  }
+  if (totalMinutes >= 4 * 60 && totalMinutes < 9 * 60 + 30) {
+    return { label: "盘前", badgeClass: "freshness-badge--mixed", zeroProfit: true };
+  }
+  if (totalMinutes >= 9 * 60 + 30 && totalMinutes < 16 * 60) {
+    return { label: "盘中", badgeClass: "freshness-badge--today", zeroProfit: false };
+  }
+  if (totalMinutes >= 16 * 60 && totalMinutes < 20 * 60) {
+    return { label: "盘后", badgeClass: "freshness-badge--mixed", zeroProfit: false };
+  }
+  return { label: "夜盘", badgeClass: "freshness-badge--yesterday", zeroProfit: true };
+}
+
+function shouldCountAssetForDailyProfit(asset) {
+  if (!isAssetQuoteCurrent(asset)) {
+    return false;
+  }
+  if (!isUsEquityPlatform(asset?.platform)) {
+    return true;
+  }
+  const session = getUsMarketSessionInfo();
+  return session.label === "盘中" || session.label === "盘后";
 }
 
 function normalizeQuoteDate(value) {
@@ -1456,6 +1493,10 @@ function addDaysToDateString(dateText, days) {
   const nextMonth = String(date.getUTCMonth() + 1).padStart(2, "0");
   const nextDay = String(date.getUTCDate()).padStart(2, "0");
   return `${nextYear}-${nextMonth}-${nextDay}`;
+}
+
+function getAssetQuoteLagToleranceDays(asset) {
+  return asset?.type === "fund" ? 1 : 0;
 }
 
 function getBeijingDateString(value) {
@@ -1494,6 +1535,16 @@ function getEffectiveQuoteDate(asset) {
 
 function isAssetQuoteToday(asset) {
   return getEffectiveQuoteDate(asset) === getTodayDateString();
+}
+
+function isAssetQuoteCurrent(asset) {
+  const quoteDate = getEffectiveQuoteDate(asset);
+  if (!quoteDate) {
+    return false;
+  }
+  const toleranceDays = getAssetQuoteLagToleranceDays(asset);
+  const earliestValidDate = addDaysToDateString(getTodayDateString(), -toleranceDays);
+  return Boolean(earliestValidDate) && quoteDate >= earliestValidDate;
 }
 
 function getAssetQuoteDateText(asset) {
@@ -2846,30 +2897,35 @@ function renderPlatformSummary(assets) {
         const freeCashValue = Math.abs(group.freeCashCny);
         const unitLabel = getPlatformCurrency(group.platform);
         const displayUnit = state.accountOverviewCurrency || inferAccountOverviewCurrency();
+        const netValueText = getMaskedSensitiveText(formatCurrencyByUnit(group.netValue, displayUnit));
+        const holdingsValueText = getMaskedSensitiveText(formatCurrencyByUnit(group.holdingsValue, displayUnit));
+        const totalProfitText = getMaskedSensitiveText(formatCurrencyByUnit(group.totalProfit, displayUnit));
+        const freeCashText = getMaskedSensitiveText(formatCurrencyByUnit(freeCashValue, displayUnit));
+        const freeCashNativeText = getMaskedSensitiveText(`${formatNumber(group.freeCashNative)} ${unitLabel}`, `**** ${unitLabel}`);
         return `
           <article class="stat-card account-summary-card">
             <div class="account-summary-card__head">
               <div class="account-summary-card__title">
                 <span>${escapeHtml(getPlatformLabel(group.platform))}</span>
               </div>
-              <strong class="${getToneClass(group.netValue)}">${formatCurrencyByUnit(group.netValue, displayUnit)}</strong>
+              <strong class="${getToneClass(group.netValue)}">${netValueText}</strong>
             </div>
           <div class="account-summary-card__grid">
             <div>
               <span>持仓市值</span>
-              <strong>${formatCurrencyByUnit(group.holdingsValue, displayUnit)}</strong>
+              <strong>${holdingsValueText}</strong>
             </div>
             <div>
               <span>累计收益</span>
-              <strong class="${getToneClass(group.totalProfit)}">${formatCurrencyByUnit(group.totalProfit, displayUnit)}</strong>
+              <strong class="${getToneClass(group.totalProfit)}">${totalProfitText}</strong>
             </div>
             <div>
               <span>${freeCashLabel}</span>
-              <strong class="${getToneClass(group.freeCashCny)}">${formatCurrencyByUnit(freeCashValue, displayUnit)}</strong>
+              <strong class="${getToneClass(group.freeCashCny)}">${freeCashText}</strong>
             </div>
             <div>
               <span>自由资金（原币）</span>
-              <strong>${formatNumber(group.freeCashNative)} ${unitLabel}</strong>
+              <strong>${freeCashNativeText}</strong>
             </div>
           </div>
           <div class="account-balance-form">
@@ -2923,7 +2979,7 @@ function renderHomepageAssetDistribution(assets) {
 
   const activeBuckets = buckets.filter((item) => item.value > 0.0001);
   const total = activeBuckets.reduce((sum, item) => sum + item.value, 0);
-  totalElement.textContent = total > 0 ? formatCurrency(total) : "暂无数据";
+  totalElement.textContent = total > 0 ? getMaskedSensitiveText(formatCurrency(total)) : "暂无数据";
 
   if (!activeBuckets.length || total <= 0) {
     chartElement.innerHTML = `<div class="distribution-card__chart-empty">暂无数据</div>`;
@@ -2973,7 +3029,7 @@ function renderHomepageAssetDistribution(assets) {
             <strong>${escapeHtml(item.label)}</strong>
             <small>${ratio.toFixed(1)}%</small>
           </div>
-          <div class="distribution-card__value">${formatCurrency(item.value)}</div>
+          <div class="distribution-card__value">${getMaskedSensitiveText(formatCurrency(item.value))}</div>
         </div>
       `;
     })
@@ -3016,9 +3072,9 @@ function renderHomepagePlatformProfit(assets) {
                 <small>${escapeHtml(row.dateText)}</small>
               </div>
             </div>
-            <div class="platform-profit-row__metrics">
-              <strong class="${getToneClass(row.dailyProfit)}">${formatCurrency(row.dailyProfit)}</strong>
-              <small>${formatSignedNumber(row.dailyRate)}%</small>
+            <div class="platform-profit-row__metrics ${row.isStaleOnly ? "platform-profit-row__metrics--stale" : ""}">
+              <strong class="${row.isStaleOnly ? "number-flat" : getToneClass(row.displayDailyProfit)}">${formatCurrency(row.displayDailyProfit)}</strong>
+              <small>${formatSignedNumber(row.displayDailyRate)}%</small>
             </div>
           </div>
         `)
@@ -3033,10 +3089,10 @@ function renderHomepagePlatformProfit(assets) {
         <article class="platform-profit-modal-item">
           <div>
             <strong>${index + 1}. ${escapeHtml(getPlatformLabel(row.platform))}</strong>
-            <small>${row.freshnessLabel} · ${escapeHtml(row.dateText)} · 当日收益率 ${formatSignedNumber(row.dailyRate)}%</small>
+            <small>${row.freshnessLabel} · ${escapeHtml(row.dateText)} · ${row.metricLabel} ${formatSignedNumber(row.displayDailyRate)}%</small>
           </div>
-          <div class="platform-profit-modal-item__values">
-            <strong class="${getToneClass(row.dailyProfit)}">${formatCurrency(row.dailyProfit)}</strong>
+          <div class="platform-profit-modal-item__values ${row.isStaleOnly ? "platform-profit-modal-item__values--stale" : ""}">
+            <strong class="${row.isStaleOnly ? "number-flat" : getToneClass(row.displayDailyProfit)}">${formatCurrency(row.displayDailyProfit)}</strong>
           </div>
         </article>
       `)
@@ -3053,8 +3109,11 @@ function buildHomepagePlatformProfitRows(assets) {
         platform,
         dailyProfit: 0,
         costValue: 0,
+        displayDailyProfit: 0,
+        displayCostValue: 0,
         latestQuoteDate: "",
         hasTodayData: false,
+        hasCurrentData: false,
         hasNonTodayData: false
       };
     }
@@ -3065,6 +3124,9 @@ function buildHomepagePlatformProfitRows(assets) {
       }
       if (quoteDate === getTodayDateString()) {
         groups[platform].hasTodayData = true;
+      }
+      if (isAssetQuoteCurrent(asset)) {
+        groups[platform].hasCurrentData = true;
       } else {
         groups[platform].hasNonTodayData = true;
       }
@@ -3072,21 +3134,61 @@ function buildHomepagePlatformProfitRows(assets) {
       groups[platform].hasNonTodayData = true;
     }
 
-    if (isAssetQuoteToday(asset)) {
+    groups[platform].displayDailyProfit += getQuoteProfitValue(asset);
+    groups[platform].displayCostValue += Math.max(0, getCostValue(asset));
+
+    if (shouldCountAssetForDailyProfit(asset)) {
       groups[platform].dailyProfit += getDailyProfit(asset);
       groups[platform].costValue += Math.max(0, getCostValue(asset));
     }
   }
 
   return Object.values(groups)
-    .map((row) => ({
-      ...row,
-      dailyRate: row.costValue > 0 ? (row.dailyProfit / row.costValue) * 100 : 0,
-      freshnessLabel: row.hasTodayData ? (row.hasNonTodayData ? "部分更新" : "今日") : "昨日",
-      freshnessClass: row.hasTodayData ? (row.hasNonTodayData ? "freshness-badge--mixed" : "freshness-badge--today") : "freshness-badge--yesterday",
-      dateText: row.latestQuoteDate || "未知日期"
-    }))
+    .map((row) => {
+      const isStaleOnly = !row.hasCurrentData;
+      const effectiveDailyProfit = isStaleOnly ? 0 : row.dailyProfit;
+      const effectiveCostValue = isStaleOnly ? 0 : row.costValue;
+      const isUsPlatform = isUsEquityPlatform(row.platform);
+      const usSession = isUsPlatform ? getUsMarketSessionInfo() : null;
+      const shouldForceZero = Boolean(usSession?.zeroProfit);
+      const displayDailyProfit = shouldForceZero
+        ? 0
+        : (isStaleOnly ? row.displayDailyProfit : row.dailyProfit);
+      const displayDailyRate = shouldForceZero
+        ? 0
+        : (isStaleOnly
+          ? (row.displayCostValue > 0 ? (row.displayDailyProfit / row.displayCostValue) * 100 : 0)
+          : (row.costValue > 0 ? (row.dailyProfit / row.costValue) * 100 : 0));
+      const freshnessLabel = isUsPlatform
+        ? usSession.label
+        : (row.hasTodayData ? (row.hasNonTodayData ? "部分更新" : "今日") : (row.hasCurrentData ? "最新" : "昨日"));
+      const freshnessClass = isUsPlatform
+        ? usSession.badgeClass
+        : (row.hasTodayData ? (row.hasNonTodayData ? "freshness-badge--mixed" : "freshness-badge--today") : (row.hasCurrentData ? "freshness-badge--today" : "freshness-badge--yesterday"));
+      const metricLabel = shouldForceZero
+        ? "夜盘收益率"
+        : (isUsPlatform
+          ? `${usSession.label}收益率`
+          : (isStaleOnly ? "昨日收益率" : (row.hasTodayData ? "当日收益率" : "最新收益率")));
+      return {
+        ...row,
+        isStaleOnly,
+        isUsPlatform,
+        metricLabel,
+        dailyProfit: effectiveDailyProfit,
+        costValue: effectiveCostValue,
+        displayDailyProfit,
+        displayDailyRate,
+        dailyRate: effectiveCostValue > 0 ? (effectiveDailyProfit / effectiveCostValue) * 100 : 0,
+        freshnessLabel,
+        freshnessClass,
+        dateText: row.latestQuoteDate || "未知日期"
+      };
+    })
     .sort((left, right) => {
+      if (right.hasCurrentData !== left.hasCurrentData) {
+        return Number(right.hasCurrentData) - Number(left.hasCurrentData);
+      }
       if (right.hasTodayData !== left.hasTodayData) {
         return Number(right.hasTodayData) - Number(left.hasTodayData);
       }
@@ -3131,6 +3233,44 @@ function formatNumber(value) {
 function formatSignedNumber(value) {
   const normalized = Number.isFinite(value) ? value : 0;
   return normalized >= 0 ? `+${normalized.toFixed(2)}` : normalized.toFixed(2);
+}
+
+function getMaskedSensitiveText(value, hiddenValue = "****") {
+  return state.accountValuesVisible ? value : hiddenValue;
+}
+
+function renderAccountPrivacyToggle() {
+  const button = document.querySelector("#account-privacy-toggle");
+  if (!button) {
+    return;
+  }
+  const isVisible = Boolean(state.accountValuesVisible);
+  button.setAttribute("aria-pressed", String(isVisible));
+  button.setAttribute("aria-label", isVisible ? "Hide account overview data" : "Show account overview data");
+  button.innerHTML = `<span class="privacy-toggle__icon" aria-hidden="true">${getAccountPrivacyIcon(isVisible)}</span>`;
+}
+
+function getAccountPrivacyIcon(isVisible) {
+  if (isVisible) {
+    return `
+      <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+        <path d="M2 12s3.6-6 10-6 10 6 10 6-3.6 6-10 6-10-6-10-6Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+        <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="1.8"></circle>
+      </svg>
+    `;
+  }
+  return `
+    <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+      <path d="M3 3l18 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path>
+      <path d="M10.6 6.3A10.9 10.9 0 0 1 12 6c6.4 0 10 6 10 6a18.4 18.4 0 0 1-3.5 4.2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+      <path d="M6.7 6.7C4.1 8.1 2 12 2 12s3.6 6 10 6c1.7 0 3.2-.4 4.5-1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
+  `;
+}
+
+function toggleAccountValuesVisibility() {
+  state.accountValuesVisible = !state.accountValuesVisible;
+  render();
 }
 
 function applyNumberTone(element, value) {

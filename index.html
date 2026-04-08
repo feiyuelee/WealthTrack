@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="./styles.css?v=20260408-6">
+  <link rel="stylesheet" href="./styles.css?v=20260408-8">
 </head>
 <body>
   <div class="app-shell">
@@ -89,7 +89,10 @@
             <div id="asset-distribution-card" class="distribution-card">
               <div class="distribution-card__head">
                 <span>资产分布</span>
-                <small id="asset-distribution-total">暂无数据</small>
+                <div class="distribution-card__actions">
+                  <button id="account-privacy-toggle" type="button" class="ghost-button privacy-toggle" aria-pressed="false" aria-label="Show account overview data"></button>
+                  <small id="asset-distribution-total">暂无数据</small>
+                </div>
               </div>
               <div class="distribution-card__body">
                 <div id="asset-distribution-chart" class="distribution-card__chart"></div>
@@ -478,6 +481,6 @@
 
   <div id="toast" class="toast" aria-live="polite"></div>
 
-    <script src="./app.js?v=20260408-15"></script>
+    <script src="./app.js?v=20260408-18"></script>
 </body>
 </html>

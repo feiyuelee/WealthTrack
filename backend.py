@@ -347,6 +347,10 @@ class AccountBalancePayload(BaseModel):
     updatedAt: str
 
 
+class BatchQuoteRefreshPayload(BaseModel):
+    assets: list[AssetPayload]
+
+
 app = FastAPI(title="WealthTrack API")
 app.add_middleware(
     CORSMiddleware,
@@ -371,6 +375,53 @@ def get_current_user(session_cookie: str | None) -> sqlite3.Row:
     if not user:
         raise HTTPException(status_code=401, detail="用户不存在")
     return user
+
+
+def save_asset_record(conn: sqlite3.Connection, user_id: int, payload: AssetPayload) -> None:
+    conn.execute(
+        """
+        INSERT INTO assets (
+            id, user_id, name, platform, type, symbol, quantity, cost_price,
+            current_price, previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            user_id = excluded.user_id,
+            name = excluded.name,
+            platform = excluded.platform,
+            type = excluded.type,
+            symbol = excluded.symbol,
+            quantity = excluded.quantity,
+            cost_price = excluded.cost_price,
+            current_price = excluded.current_price,
+            previous_close = excluded.previous_close,
+            currency = excluded.currency,
+            fx_rate = excluded.fx_rate,
+            quote_source = excluded.quote_source,
+            quote_date = excluded.quote_date,
+            quote_fetched_at = excluded.quote_fetched_at,
+            notes = excluded.notes,
+            updated_at = excluded.updated_at
+        """,
+        (
+            payload.id,
+            user_id,
+            payload.name,
+            payload.platform,
+            payload.type,
+            payload.symbol,
+            payload.quantity,
+            payload.costPrice,
+            payload.currentPrice,
+            payload.previousClose,
+            payload.currency,
+            payload.fxRate,
+            payload.quoteSource,
+            payload.quoteDate,
+            payload.quoteFetchedAt,
+            payload.notes,
+            payload.updatedAt,
+        ),
+    )
 
 
 def is_admin_user(user: sqlite3.Row | dict[str, Any]) -> bool:
@@ -1109,50 +1160,7 @@ def list_assets(session_cookie: str | None = Cookie(default=None, alias=SESSION_
 def save_asset(payload: AssetPayload, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     user = get_current_user(session_cookie)
     with closing(get_db()) as conn:
-        conn.execute(
-            """
-            INSERT INTO assets (
-                id, user_id, name, platform, type, symbol, quantity, cost_price,
-                current_price, previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                user_id = excluded.user_id,
-                name = excluded.name,
-                platform = excluded.platform,
-                type = excluded.type,
-                symbol = excluded.symbol,
-                quantity = excluded.quantity,
-                cost_price = excluded.cost_price,
-                current_price = excluded.current_price,
-                previous_close = excluded.previous_close,
-                currency = excluded.currency,
-                fx_rate = excluded.fx_rate,
-                quote_source = excluded.quote_source,
-                quote_date = excluded.quote_date,
-                quote_fetched_at = excluded.quote_fetched_at,
-                notes = excluded.notes,
-                updated_at = excluded.updated_at
-            """,
-            (
-                payload.id,
-                user["id"],
-                payload.name,
-                payload.platform,
-                payload.type,
-                payload.symbol,
-                payload.quantity,
-                payload.costPrice,
-                payload.currentPrice,
-                payload.previousClose,
-                payload.currency,
-                payload.fxRate,
-                payload.quoteSource,
-                payload.quoteDate,
-                payload.quoteFetchedAt,
-                payload.notes,
-                payload.updatedAt,
-            ),
-        )
+        save_asset_record(conn, user["id"], payload)
         conn.commit()
     return {"asset": payload.model_dump()}
 
@@ -1274,6 +1282,63 @@ def quote_resolve(payload: AssetPayload, session_cookie: str | None = Cookie(def
     if "quoteFetchedAt" not in quote or not quote["quoteFetchedAt"]:
         quote["quoteFetchedAt"] = now_iso()
     return {"quote": quote}
+
+
+@app.post("/api/quotes/refresh")
+def quote_refresh_batch(
+    payload: BatchQuoteRefreshPayload,
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    assets = payload.assets or []
+    if not assets:
+        return {"assets": [], "successCount": 0, "failureCount": 0}
+
+    with closing(get_db()) as conn:
+        settings = get_shared_settings(conn)
+
+    refreshed_assets: list[dict[str, Any]] = []
+    success_count = 0
+    failure_count = 0
+    worker_count = max(1, min(6, len(assets)))
+
+    def refresh_one(asset: AssetPayload) -> tuple[AssetPayload, bool]:
+        try:
+            quote = resolve_quote(asset, settings)
+            quote_fetched_at = quote.get("quoteFetchedAt") or now_iso()
+            updated_asset = asset.model_copy(
+                update={
+                    "currentPrice": quote.get("currentPrice", asset.currentPrice),
+                    "previousClose": quote.get("previousClose", asset.previousClose),
+                    "symbol": quote.get("normalizedSymbol") or asset.symbol,
+                    "quoteSource": quote.get("quoteSource") or asset.quoteSource,
+                    "quoteDate": quote.get("quoteDate") if "quoteDate" in quote else "",
+                    "quoteFetchedAt": quote_fetched_at,
+                    "updatedAt": now_iso(),
+                }
+            )
+            return updated_asset, True
+        except Exception:
+            return asset, False
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        results = list(executor.map(refresh_one, assets))
+
+    with closing(get_db()) as conn:
+        for asset, ok in results:
+            if ok:
+                success_count += 1
+                save_asset_record(conn, user["id"], asset)
+            else:
+                failure_count += 1
+            refreshed_assets.append(asset.model_dump())
+        conn.commit()
+
+    return {
+        "assets": refreshed_assets,
+        "successCount": success_count,
+        "failureCount": failure_count,
+    }
 
 
 @app.get("/api/fx/rates")
