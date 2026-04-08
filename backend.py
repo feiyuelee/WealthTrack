@@ -524,6 +524,37 @@ def normalize_eastmoney_secid(symbol: str) -> tuple[str, str]:
     return normalized, f"{market_map[market]}.{code}"
 
 
+def is_cn_exchange_traded_fund_symbol(symbol: str) -> bool:
+    normalized = symbol.strip().upper()
+    if re.fullmatch(r"\d{6}\.(SH|SZ)", normalized) is None:
+        return False
+    code = normalized.split(".", 1)[0]
+    return code.startswith(("1", "5"))
+
+
+def normalize_cn_etf_price_anomaly(
+    current_price: float,
+    previous_close: float,
+    asset_previous_close: float,
+    symbol: str,
+    asset_type: str,
+) -> tuple[float, float]:
+    if asset_type != "fund" or not is_cn_exchange_traded_fund_symbol(symbol):
+        return current_price, previous_close
+
+    reference_previous_close = float(asset_previous_close or 0)
+    if current_price < 10 or reference_previous_close <= 0:
+        return current_price, previous_close
+
+    ratio = current_price / reference_previous_close if reference_previous_close else 0
+    if 9.5 <= ratio <= 10.5:
+        normalized_current = current_price / 10
+        normalized_previous = previous_close / 10 if previous_close > 0 else previous_close
+        return normalized_current, normalized_previous
+
+    return current_price, previous_close
+
+
 def read_series_value(record: Any, *candidates: str) -> float:
     for key in candidates:
         for candidate in (key, key.lower(), key.upper()):
@@ -1426,9 +1457,18 @@ def resolve_tushare_realtime_quote(asset: AssetPayload, settings: sqlite3.Row) -
 
     row = dataframe.iloc[0]
     quote_date = get_cn_equity_effective_quote_date(token)
+    current_price = read_series_value(row, "price", "close", "last")
+    previous_close = read_series_value(row, "pre_close", "prev_close")
+    current_price, previous_close = normalize_cn_etf_price_anomaly(
+        current_price,
+        previous_close,
+        asset.previousClose,
+        ts_code,
+        asset.type,
+    )
     return {
-        "currentPrice": read_series_value(row, "price", "close", "last"),
-        "previousClose": read_series_value(row, "pre_close", "prev_close"),
+        "currentPrice": current_price,
+        "previousClose": previous_close,
         "normalizedSymbol": ts_code,
         "quoteSource": "tushare",
         "quoteDate": quote_date,
