@@ -504,6 +504,10 @@ function bindEvents() {
   if (transactionPlatform) {
     transactionPlatform.addEventListener("change", syncTransactionFormByKind);
   }
+  const transactionTradePlatform = document.querySelector("#transaction-trade-platform");
+  if (transactionTradePlatform) {
+    transactionTradePlatform.addEventListener("change", syncTransactionFormByKind);
+  }
   const transactionAssetSelect = document.querySelector("#transaction-asset-id");
   if (transactionAssetSelect) {
     transactionAssetSelect.addEventListener("change", syncTransactionAssetSelection);
@@ -805,6 +809,7 @@ function syncTransactionFormByKind() {
   const form = document.querySelector("#transaction-form");
   const kindField = document.querySelector("#transaction-kind");
   const platformField = document.querySelector("#transaction-platform");
+  const tradePlatformField = document.querySelector("#transaction-trade-platform");
   const assetFields = document.querySelectorAll("[data-transaction-asset-field]");
   const cashField = document.querySelector("[data-transaction-cash-field]");
   const cashMetaFields = document.querySelectorAll("[data-transaction-cash-meta-field]");
@@ -845,15 +850,31 @@ function syncTransactionFormByKind() {
   if (amountLabel) {
     amountLabel.textContent = kind === "deposit" ? "入金金额" : "出金金额";
   }
-  if (assetSelect) {
-    const assets = state.assets
+  const tradeAssets = state.assets
       .filter((asset) => !["cash", "liability"].includes(asset.type))
       .sort((left, right) => String(left.name || left.symbol).localeCompare(String(right.name || right.symbol), "zh-CN"));
-    if (state.editingTransactionAsset && !assets.some((asset) => asset.id === state.editingTransactionAsset.id || (asset.platform === state.editingTransactionAsset.platform && asset.type === state.editingTransactionAsset.type && asset.symbol === state.editingTransactionAsset.symbol))) {
-      assets.unshift(state.editingTransactionAsset);
+  if (state.editingTransactionAsset && !tradeAssets.some((asset) => asset.id === state.editingTransactionAsset.id || (asset.platform === state.editingTransactionAsset.platform && asset.type === state.editingTransactionAsset.type && asset.symbol === state.editingTransactionAsset.symbol))) {
+    tradeAssets.unshift(state.editingTransactionAsset);
+  }
+  const platformOptions = [...new Set(tradeAssets.map((asset) => asset.platform).filter(Boolean))];
+  const previousTradePlatform = tradePlatformField ? tradePlatformField.value : "";
+  if (tradePlatformField) {
+    tradePlatformField.innerHTML = platformOptions.length
+      ? platformOptions.map((platform) => `<option value="${escapeHtml(platform)}">${escapeHtml(getPlatformLabel(platform))}</option>`).join("")
+      : '<option value="">暂无平台</option>';
+    const nextPlatform = previousTradePlatform && platformOptions.includes(previousTradePlatform)
+      ? previousTradePlatform
+      : (state.editingTransactionAsset?.platform && platformOptions.includes(state.editingTransactionAsset.platform) ? state.editingTransactionAsset.platform : platformOptions[0] || "");
+    tradePlatformField.value = nextPlatform;
+  }
+  if (assetSelect) {
+    const activePlatform = tradePlatformField?.value || "";
+    const assets = tradeAssets.filter((asset) => !activePlatform || asset.platform === activePlatform);
+    if (tradePlatformField?.value) {
+      platformField.value = tradePlatformField.value;
     }
     assetSelect.innerHTML = assets.length
-      ? assets.map((asset) => `<option value="${escapeHtml(asset.id)}">${escapeHtml(asset.name)} · ${escapeHtml(asset.symbol)} · ${escapeHtml(String(asset.platform || "").toUpperCase())}</option>`).join("")
+      ? assets.map((asset) => `<option value="${escapeHtml(asset.id)}">${escapeHtml(asset.name)} · ${escapeHtml(asset.symbol)}</option>`).join("")
       : '<option value="">暂无可交易资产</option>';
     if (previousAssetId && assets.some((asset) => asset.id === previousAssetId)) {
       assetSelect.value = previousAssetId;
@@ -865,12 +886,16 @@ function syncTransactionFormByKind() {
 function syncTransactionAssetSelection() {
   const assetSelect = document.querySelector("#transaction-asset-id");
   const platformField = document.querySelector("#transaction-platform");
+  const tradePlatformField = document.querySelector("#transaction-trade-platform");
   if (!assetSelect) {
     return;
   }
   const asset = state.assets.find((item) => item.id === assetSelect.value);
   if (state.transactionMode !== "cash" && platformField && asset?.platform) {
     platformField.value = asset.platform;
+  }
+  if (state.transactionMode !== "cash" && tradePlatformField && asset?.platform) {
+    tradePlatformField.value = asset.platform;
   }
 }
 
@@ -895,6 +920,7 @@ function fillTransactionFormFromRecord(record) {
 
   const kindField = document.querySelector("#transaction-kind");
   const platformField = document.querySelector("#transaction-platform");
+  const tradePlatformField = document.querySelector("#transaction-trade-platform");
   const assetField = document.querySelector("#transaction-asset-id");
   const quantityField = document.querySelector("#transaction-quantity");
   const priceField = document.querySelector("#transaction-price");
@@ -906,6 +932,9 @@ function fillTransactionFormFromRecord(record) {
   }
   if (platformField) {
     platformField.value = record.platform || "ibkr";
+  }
+  if (tradePlatformField) {
+    tradePlatformField.value = record.platform || "ibkr";
   }
   if (assetField && (record.kind === "buy" || record.kind === "sell")) {
     const matchedAsset = state.assets.find((item) => item.id === record.id)
@@ -938,8 +967,12 @@ function resetTransactionForm() {
   state.editingTransactionAsset = null;
   state.transactionMode = state.entryMode === "cash" ? "cash" : "trade";
   const platformField = document.querySelector("#transaction-platform");
+  const tradePlatformField = document.querySelector("#transaction-trade-platform");
   if (platformField && !platformField.value) {
     platformField.value = "ibkr";
+  }
+  if (tradePlatformField && !tradePlatformField.value) {
+    tradePlatformField.value = "ibkr";
   }
   syncTransactionFormByKind();
 }
@@ -1084,11 +1117,12 @@ async function handleTransactionSubmit(event) {
 
   const kind = String(document.querySelector("#transaction-kind")?.value || "").trim();
   const rawPlatform = String(document.querySelector("#transaction-platform")?.value || "").trim();
+  const rawTradePlatform = String(document.querySelector("#transaction-trade-platform")?.value || "").trim();
   const selectedAssetId = String(document.querySelector("#transaction-asset-id")?.value || "").trim();
   const selectedAsset = state.assets.find((item) => item.id === selectedAssetId)
     || (state.editingTransactionAsset && state.editingTransactionAsset.id === selectedAssetId ? state.editingTransactionAsset : null);
   const platform = (kind === "buy" || kind === "sell")
-    ? String(selectedAsset?.platform || rawPlatform).trim()
+    ? String(selectedAsset?.platform || rawTradePlatform || rawPlatform).trim()
     : rawPlatform;
   const currency = String(selectedAsset?.currency || getPlatformCurrency(platform)).trim().toUpperCase();
   if (currency !== "CNY") {

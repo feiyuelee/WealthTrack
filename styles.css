@@ -835,9 +835,9 @@ th {
 }
 
 .transaction-form {
-  --transaction-field-width: 250px;
+  --transaction-field-width: 300px;
   margin-top: 22px;
-  max-width: 780px;
+  max-width: 920px;
   padding: 20px 20px 16px;
   border-radius: 26px;
   background: linear-gradient(180deg, rgba(255, 251, 246, 0.88) 0%, rgba(251, 244, 235, 0.74) 100%);
@@ -856,12 +856,13 @@ th {
 }
 
 .transaction-form__asset-row {
-  grid-template-columns: minmax(0, var(--transaction-field-width));
+  grid-template-columns: repeat(2, minmax(0, var(--transaction-field-width)));
 }
 
 .transaction-form__stack {
   display: grid;
   gap: 16px;
+  grid-template-columns: minmax(0, var(--transaction-field-width));
 }
 
 .transaction-form__asset-field {
