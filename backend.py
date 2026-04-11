@@ -247,6 +247,21 @@ def ensure_asset_columns(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def ensure_transaction_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(transactions)").fetchall()}
+    if "cost_price" not in columns:
+        conn.execute("ALTER TABLE transactions ADD COLUMN cost_price REAL NOT NULL DEFAULT 0")
+        conn.commit()
+        columns.add("cost_price")
+    if "current_price" not in columns:
+        conn.execute("ALTER TABLE transactions ADD COLUMN current_price REAL NOT NULL DEFAULT 0")
+        conn.commit()
+        columns.add("current_price")
+    if "previous_close" not in columns:
+        conn.execute("ALTER TABLE transactions ADD COLUMN previous_close REAL NOT NULL DEFAULT 0")
+        conn.commit()
+
+
 def ensure_admin_user(conn: sqlite3.Connection) -> None:
     username = ADMIN_USERNAME
     salt = secrets.token_hex(16)
@@ -352,6 +367,9 @@ def init_db() -> None:
                 asset_type TEXT NOT NULL DEFAULT '',
                 symbol TEXT NOT NULL DEFAULT '',
                 quantity REAL NOT NULL DEFAULT 0,
+                cost_price REAL NOT NULL DEFAULT 0,
+                current_price REAL NOT NULL DEFAULT 0,
+                previous_close REAL NOT NULL DEFAULT 0,
                 price REAL NOT NULL DEFAULT 0,
                 fee REAL NOT NULL DEFAULT 0,
                 cash_amount REAL NOT NULL DEFAULT 0,
@@ -370,6 +388,7 @@ def init_db() -> None:
         ensure_user_settings_columns(conn)
         ensure_account_balance_columns(conn)
         ensure_asset_columns(conn)
+        ensure_transaction_columns(conn)
         ensure_admin_user(conn)
         conn.commit()
 
@@ -554,6 +573,9 @@ class TransactionPayload(BaseModel):
     assetType: str = ""
     symbol: str = ""
     quantity: float = 0
+    costPrice: float = 0
+    currentPrice: float = 0
+    previousClose: float = 0
     price: float = 0
     fee: float = 0
     cashAmount: float = 0
@@ -678,15 +700,180 @@ def row_to_asset_payload(row: sqlite3.Row) -> AssetPayload:
     )
 
 
+def row_to_transaction_payload(row: sqlite3.Row) -> TransactionPayload:
+    return TransactionPayload(
+        id=row["id"],
+        kind=row["kind"],
+        platform=row["platform"],
+        assetName=row["asset_name"],
+        assetType=row["asset_type"],
+        symbol=row["symbol"],
+        quantity=row["quantity"],
+        costPrice=row["cost_price"],
+        currentPrice=row["current_price"],
+        previousClose=row["previous_close"],
+        price=row["price"],
+        fee=row["fee"],
+        cashAmount=row["cash_amount"],
+        currency=row["currency"],
+        fxRate=row["fx_rate"],
+        quoteSource=row["quote_source"],
+        quoteDate=row["quote_date"],
+        notes=row["notes"],
+        occurredAt=row["occurred_at"],
+    )
+
+
+def upsert_transaction_record(
+    conn: sqlite3.Connection,
+    user_id: int,
+    payload: TransactionPayload,
+    created_at: str | None = None,
+) -> None:
+    existing = conn.execute(
+        "SELECT created_at FROM transactions WHERE id = ? AND user_id = ?",
+        (payload.id, user_id),
+    ).fetchone()
+    created_text = created_at or (existing["created_at"] if existing else now_iso())
+    conn.execute(
+        """
+        INSERT INTO transactions (
+            id, user_id, kind, platform, asset_name, asset_type, symbol, quantity, cost_price, current_price,
+            previous_close, price, fee, cash_amount, currency, fx_rate, quote_source, quote_date,
+            realized_profit, notes, occurred_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            user_id = excluded.user_id,
+            kind = excluded.kind,
+            platform = excluded.platform,
+            asset_name = excluded.asset_name,
+            asset_type = excluded.asset_type,
+            symbol = excluded.symbol,
+            quantity = excluded.quantity,
+            cost_price = excluded.cost_price,
+            current_price = excluded.current_price,
+            previous_close = excluded.previous_close,
+            price = excluded.price,
+            fee = excluded.fee,
+            cash_amount = excluded.cash_amount,
+            currency = excluded.currency,
+            fx_rate = excluded.fx_rate,
+            quote_source = excluded.quote_source,
+            quote_date = excluded.quote_date,
+            realized_profit = excluded.realized_profit,
+            notes = excluded.notes,
+            occurred_at = excluded.occurred_at
+        """,
+        (
+            payload.id,
+            user_id,
+            str(payload.kind or "").strip().lower(),
+            str(payload.platform or "").strip().lower(),
+            str(payload.assetName or "").strip(),
+            str(payload.assetType or "").strip().lower(),
+            str(payload.symbol or "").strip().upper(),
+            float(payload.quantity or 0),
+            float(payload.costPrice or 0),
+            float(payload.currentPrice or 0),
+            float(payload.previousClose or 0),
+            float(payload.price or 0),
+            float(payload.fee or 0),
+            float(payload.cashAmount or 0),
+            str(payload.currency or "").strip().upper(),
+            float(payload.fxRate or 0),
+            str(payload.quoteSource or "manual").strip(),
+            str(payload.quoteDate or "").strip(),
+            0.0,
+            str(payload.notes or "").strip(),
+            payload.occurredAt,
+            created_text,
+        ),
+    )
+
+
+def bootstrap_legacy_records_for_user(conn: sqlite3.Connection, user_id: int) -> None:
+    asset_rows = conn.execute(
+        """
+        SELECT id, name, platform, type, symbol, quantity, cost_price, current_price, previous_close,
+               currency, fx_rate, quote_source, quote_date, notes, updated_at
+        FROM assets
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchall()
+    for row in asset_rows:
+        existing = conn.execute(
+            "SELECT 1 FROM transactions WHERE id = ? AND user_id = ? AND kind = 'asset'",
+            (row["id"], user_id),
+        ).fetchone()
+        if existing:
+            continue
+        upsert_transaction_record(
+            conn,
+            user_id,
+            TransactionPayload(
+                id=row["id"],
+                kind="asset",
+                platform=row["platform"],
+                assetName=row["name"],
+                assetType=row["type"],
+                symbol=row["symbol"],
+                quantity=row["quantity"],
+                costPrice=row["cost_price"],
+                currentPrice=row["current_price"],
+                previousClose=row["previous_close"],
+                price=row["current_price"],
+                currency=row["currency"],
+                fxRate=row["fx_rate"],
+                quoteSource=row["quote_source"],
+                quoteDate=row["quote_date"],
+                notes=row["notes"],
+                occurredAt=row["updated_at"] or now_iso(),
+            ),
+            created_at=row["updated_at"] or now_iso(),
+        )
+
+    balance_rows = conn.execute(
+        """
+        SELECT platform, free_cash, display_currency, updated_at
+        FROM account_balances
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchall()
+    for row in balance_rows:
+        record_id = f"balance:{str(row['platform']).strip().lower()}"
+        existing = conn.execute(
+            "SELECT 1 FROM transactions WHERE id = ? AND user_id = ?",
+            (record_id, user_id),
+        ).fetchone()
+        if existing:
+            continue
+        upsert_transaction_record(
+            conn,
+            user_id,
+            TransactionPayload(
+                id=record_id,
+                kind="balance",
+                platform=row["platform"],
+                cashAmount=row["free_cash"],
+                currency=row["display_currency"] or get_platform_currency(row["platform"]),
+                occurredAt=row["updated_at"] or now_iso(),
+            ),
+            created_at=row["updated_at"] or now_iso(),
+        )
+
+
 def list_transactions_for_user(conn: sqlite3.Connection, user_id: int) -> list[dict[str, Any]]:
     rows = conn.execute(
         """
-        SELECT id, kind, platform, asset_name, asset_type, symbol, quantity, price, fee, cash_amount,
-               currency, fx_rate, quote_source, quote_date, realized_profit, notes, occurred_at, created_at
+        SELECT id, kind, platform, asset_name, asset_type, symbol, quantity, cost_price, current_price,
+               previous_close, price, fee, cash_amount, currency, fx_rate, quote_source, quote_date,
+               realized_profit, notes, occurred_at, created_at
         FROM transactions
         WHERE user_id = ?
         ORDER BY occurred_at DESC, created_at DESC
-        LIMIT 100
+        LIMIT 200
         """,
         (user_id,),
     ).fetchall()
@@ -699,6 +886,9 @@ def list_transactions_for_user(conn: sqlite3.Connection, user_id: int) -> list[d
             "assetType": row["asset_type"],
             "symbol": row["symbol"],
             "quantity": row["quantity"],
+            "costPrice": row["cost_price"],
+            "currentPrice": row["current_price"],
+            "previousClose": row["previous_close"],
             "price": row["price"],
             "fee": row["fee"],
             "cashAmount": row["cash_amount"],
@@ -715,7 +905,7 @@ def list_transactions_for_user(conn: sqlite3.Connection, user_id: int) -> list[d
     ]
 
 
-def apply_transaction(conn: sqlite3.Connection, user_id: int, payload: TransactionPayload) -> dict[str, Any]:
+def apply_transaction_effect(conn: sqlite3.Connection, user_id: int, payload: TransactionPayload) -> dict[str, Any]:
     kind = str(payload.kind or "").strip().lower()
     if kind not in {"buy", "sell", "deposit", "withdraw"}:
         raise HTTPException(status_code=400, detail="不支持的交易类型")
@@ -816,36 +1006,6 @@ def apply_transaction(conn: sqlite3.Connection, user_id: int, payload: Transacti
                 save_asset_record(conn, user_id, next_asset)
             upsert_account_balance(conn, user_id, platform, next_free_cash, display_currency, payload.occurredAt)
 
-    conn.execute(
-        """
-        INSERT INTO transactions (
-            id, user_id, kind, platform, asset_name, asset_type, symbol, quantity, price, fee, cash_amount,
-            currency, fx_rate, quote_source, quote_date, realized_profit, notes, occurred_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            payload.id,
-            user_id,
-            kind,
-            platform,
-            payload.assetName,
-            payload.assetType,
-            payload.symbol.strip().upper(),
-            quantity,
-            price,
-            fee,
-            cash_amount,
-            currency,
-            fx_rate,
-            payload.quoteSource,
-            payload.quoteDate,
-            realized_profit,
-            payload.notes,
-            payload.occurredAt,
-            now_text,
-        ),
-    )
-
     return {
         "transaction": {
             "id": payload.id,
@@ -868,6 +1028,111 @@ def apply_transaction(conn: sqlite3.Connection, user_id: int, payload: Transacti
             "createdAt": now_text,
         }
     }
+
+
+def rebuild_portfolio_from_records(conn: sqlite3.Connection, user_id: int) -> None:
+    records = conn.execute(
+        """
+        SELECT id, kind, platform, asset_name, asset_type, symbol, quantity, cost_price, current_price,
+               previous_close, price, fee, cash_amount, currency, fx_rate, quote_source, quote_date,
+               notes, occurred_at, created_at
+        FROM transactions
+        WHERE user_id = ?
+        ORDER BY occurred_at ASC, created_at ASC, id ASC
+        """,
+        (user_id,),
+    ).fetchall()
+
+    conn.execute("DELETE FROM assets WHERE user_id = ?", (user_id,))
+    conn.execute("DELETE FROM account_balances WHERE user_id = ?", (user_id,))
+
+    for row in records:
+        payload = row_to_transaction_payload(row)
+        kind = str(payload.kind or "").strip().lower()
+
+        if kind == "asset":
+            currency = str(payload.currency or get_platform_currency(payload.platform)).strip().upper()
+            fx_rate = resolve_fx_rate_to_cny(currency, payload.fxRate)
+            save_asset_record(
+                conn,
+                user_id,
+                AssetPayload(
+                    id=payload.id,
+                    name=str(payload.assetName or payload.symbol).strip(),
+                    platform=str(payload.platform or "").strip().lower(),
+                    type=str(payload.assetType or "").strip().lower(),
+                    symbol=str(payload.symbol or "").strip().upper(),
+                    quantity=float(payload.quantity or 0),
+                    costPrice=float(payload.costPrice or 0),
+                    currentPrice=float(payload.currentPrice or 0),
+                    previousClose=float(payload.previousClose or 0),
+                    currency=currency,
+                    fxRate=fx_rate,
+                    quoteSource=str(payload.quoteSource or "manual").strip(),
+                    quoteDate=str(payload.quoteDate or "").strip(),
+                    quoteFetchedAt=payload.occurredAt,
+                    notes=str(payload.notes or "").strip(),
+                    updatedAt=payload.occurredAt,
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE transactions
+                SET cash_amount = 0, realized_profit = 0, currency = ?, fx_rate = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (currency, fx_rate, payload.id, user_id),
+            )
+            continue
+
+        if kind == "balance":
+            currency = str(payload.currency or get_platform_currency(payload.platform)).strip().upper()
+            fx_rate = resolve_fx_rate_to_cny(currency, payload.fxRate)
+            upsert_account_balance(
+                conn,
+                user_id,
+                str(payload.platform or "").strip().lower(),
+                float(payload.cashAmount or 0),
+                currency,
+                payload.occurredAt,
+            )
+            conn.execute(
+                """
+                UPDATE transactions
+                SET realized_profit = 0, currency = ?, fx_rate = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (currency, fx_rate, payload.id, user_id),
+            )
+            continue
+
+        result = apply_transaction_effect(conn, user_id, payload)
+        transaction = result["transaction"]
+        conn.execute(
+            """
+            UPDATE transactions
+            SET platform = ?, asset_name = ?, asset_type = ?, symbol = ?, quantity = ?, price = ?, fee = ?,
+                cash_amount = ?, currency = ?, fx_rate = ?, quote_source = ?, quote_date = ?, realized_profit = ?
+            WHERE id = ? AND user_id = ?
+            """,
+            (
+                transaction["platform"],
+                transaction["assetName"],
+                transaction["assetType"],
+                transaction["symbol"],
+                transaction["quantity"],
+                transaction["price"],
+                transaction["fee"],
+                transaction["cashAmount"],
+                transaction["currency"],
+                transaction["fxRate"],
+                transaction["quoteSource"],
+                transaction["quoteDate"],
+                transaction["realizedProfit"],
+                payload.id,
+                user_id,
+            ),
+        )
 
 
 def is_admin_user(user: sqlite3.Row | dict[str, Any]) -> bool:
@@ -1598,6 +1863,8 @@ def me(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) 
 def list_assets(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     user = get_current_user(session_cookie)
     with closing(get_db()) as conn:
+        bootstrap_legacy_records_for_user(conn, int(user["id"]))
+        conn.commit()
         rows = conn.execute(
             """
             SELECT id, name, platform, type, symbol, quantity, cost_price, current_price,
@@ -1637,16 +1904,50 @@ def list_assets(session_cookie: str | None = Cookie(default=None, alias=SESSION_
 def save_asset(payload: AssetPayload, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     user = get_current_user(session_cookie)
     with closing(get_db()) as conn:
-        save_asset_record(conn, user["id"], payload)
+        bootstrap_legacy_records_for_user(conn, int(user["id"]))
+        transaction_payload = TransactionPayload(
+            id=payload.id,
+            kind="asset",
+            platform=payload.platform,
+            assetName=payload.name,
+            assetType=payload.type,
+            symbol=payload.symbol,
+            quantity=payload.quantity,
+            costPrice=payload.costPrice,
+            currentPrice=payload.currentPrice,
+            previousClose=payload.previousClose,
+            price=payload.currentPrice,
+            fee=0,
+            cashAmount=0,
+            currency=payload.currency,
+            fxRate=payload.fxRate,
+            quoteSource=payload.quoteSource,
+            quoteDate=payload.quoteDate,
+            notes=payload.notes,
+            occurredAt=payload.updatedAt,
+        )
+        upsert_transaction_record(conn, int(user["id"]), transaction_payload)
+        rebuild_portfolio_from_records(conn, int(user["id"]))
+        row = conn.execute(
+            """
+            SELECT id, name, platform, type, symbol, quantity, cost_price, current_price,
+                   previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
+            FROM assets
+            WHERE id = ? AND user_id = ?
+            """,
+            (payload.id, int(user["id"])),
+        ).fetchone()
         conn.commit()
-    return {"asset": payload.model_dump()}
+    return {"asset": row_to_asset_payload(row).model_dump() if row else payload.model_dump()}
 
 
 @app.delete("/api/assets/{asset_id}")
 def delete_asset(asset_id: str, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, str]:
     user = get_current_user(session_cookie)
     with closing(get_db()) as conn:
-        conn.execute("DELETE FROM assets WHERE id = ? AND user_id = ?", (asset_id, user["id"]))
+        bootstrap_legacy_records_for_user(conn, int(user["id"]))
+        conn.execute("DELETE FROM transactions WHERE id = ? AND user_id = ? AND kind = 'asset'", (asset_id, user["id"]))
+        rebuild_portfolio_from_records(conn, int(user["id"]))
         conn.commit()
     return {"message": "ok"}
 
@@ -1697,6 +1998,8 @@ def update_settings(payload: SettingsPayload, session_cookie: str | None = Cooki
 def list_account_balances(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     user = get_current_user(session_cookie)
     with closing(get_db()) as conn:
+        bootstrap_legacy_records_for_user(conn, int(user["id"]))
+        conn.commit()
         rows = conn.execute(
             """
             SELECT platform, free_cash, display_currency, updated_at
@@ -1723,6 +2026,8 @@ def list_account_balances(session_cookie: str | None = Cookie(default=None, alia
 def list_transactions(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     user = get_current_user(session_cookie)
     with closing(get_db()) as conn:
+        bootstrap_legacy_records_for_user(conn, int(user["id"]))
+        conn.commit()
         transactions = list_transactions_for_user(conn, int(user["id"]))
     return {"transactions": transactions}
 
@@ -1790,9 +2095,117 @@ def create_transaction(
 ) -> dict[str, Any]:
     user = get_current_user(session_cookie)
     with closing(get_db()) as conn:
-        response = apply_transaction(conn, int(user["id"]), payload)
+        bootstrap_legacy_records_for_user(conn, int(user["id"]))
+        upsert_transaction_record(conn, int(user["id"]), payload)
+        rebuild_portfolio_from_records(conn, int(user["id"]))
+        row = conn.execute(
+            """
+            SELECT id, kind, platform, asset_name, asset_type, symbol, quantity, cost_price, current_price,
+                   previous_close, price, fee, cash_amount, currency, fx_rate, quote_source, quote_date,
+                   realized_profit, notes, occurred_at, created_at
+            FROM transactions
+            WHERE id = ? AND user_id = ?
+            """,
+            (payload.id, int(user["id"])),
+        ).fetchone()
         conn.commit()
-    return response
+    return {
+        "transaction": {
+            "id": row["id"],
+            "kind": row["kind"],
+            "platform": row["platform"],
+            "assetName": row["asset_name"],
+            "assetType": row["asset_type"],
+            "symbol": row["symbol"],
+            "quantity": row["quantity"],
+            "costPrice": row["cost_price"],
+            "currentPrice": row["current_price"],
+            "previousClose": row["previous_close"],
+            "price": row["price"],
+            "fee": row["fee"],
+            "cashAmount": row["cash_amount"],
+            "currency": row["currency"],
+            "fxRate": row["fx_rate"],
+            "quoteSource": row["quote_source"],
+            "quoteDate": row["quote_date"],
+            "realizedProfit": row["realized_profit"],
+            "notes": row["notes"],
+            "occurredAt": row["occurred_at"],
+            "createdAt": row["created_at"],
+        }
+    }
+
+
+@app.put("/api/transactions/{transaction_id}")
+def update_transaction(
+    transaction_id: str,
+    payload: TransactionPayload,
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    normalized_payload = payload.model_copy(update={"id": transaction_id})
+    with closing(get_db()) as conn:
+        bootstrap_legacy_records_for_user(conn, int(user["id"]))
+        upsert_transaction_record(conn, int(user["id"]), normalized_payload)
+        rebuild_portfolio_from_records(conn, int(user["id"]))
+        row = conn.execute(
+            """
+            SELECT id, kind, platform, asset_name, asset_type, symbol, quantity, cost_price, current_price,
+                   previous_close, price, fee, cash_amount, currency, fx_rate, quote_source, quote_date,
+                   realized_profit, notes, occurred_at, created_at
+            FROM transactions
+            WHERE id = ? AND user_id = ?
+            """,
+            (transaction_id, int(user["id"])),
+        ).fetchone()
+        conn.commit()
+    return {
+        "transaction": {
+            "id": row["id"],
+            "kind": row["kind"],
+            "platform": row["platform"],
+            "assetName": row["asset_name"],
+            "assetType": row["asset_type"],
+            "symbol": row["symbol"],
+            "quantity": row["quantity"],
+            "costPrice": row["cost_price"],
+            "currentPrice": row["current_price"],
+            "previousClose": row["previous_close"],
+            "price": row["price"],
+            "fee": row["fee"],
+            "cashAmount": row["cash_amount"],
+            "currency": row["currency"],
+            "fxRate": row["fx_rate"],
+            "quoteSource": row["quote_source"],
+            "quoteDate": row["quote_date"],
+            "realizedProfit": row["realized_profit"],
+            "notes": row["notes"],
+            "occurredAt": row["occurred_at"],
+            "createdAt": row["created_at"],
+        }
+    }
+
+
+@app.delete("/api/transactions/{transaction_id}")
+def delete_transaction(transaction_id: str, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, str]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        bootstrap_legacy_records_for_user(conn, int(user["id"]))
+        conn.execute("DELETE FROM transactions WHERE id = ? AND user_id = ?", (transaction_id, int(user["id"])))
+        rebuild_portfolio_from_records(conn, int(user["id"]))
+        conn.commit()
+    return {"message": "ok"}
+
+
+@app.delete("/api/records")
+def clear_all_records(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, str]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM transactions WHERE user_id = ?", (int(user["id"]),))
+        conn.execute("DELETE FROM assets WHERE user_id = ?", (int(user["id"]),))
+        conn.execute("DELETE FROM account_balances WHERE user_id = ?", (int(user["id"]),))
+        conn.commit()
+    return {"message": "ok"}
 
 
 @app.put("/api/account-balances")
@@ -1801,27 +2214,42 @@ def save_account_balance(
     session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
 ) -> dict[str, Any]:
     user = get_current_user(session_cookie)
+    record_id = f"balance:{str(payload.platform or '').strip().lower()}"
     with closing(get_db()) as conn:
-        conn.execute(
-            """
-            INSERT INTO account_balances (user_id, platform, free_cash, display_currency, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(user_id, platform) DO UPDATE SET
-                free_cash = excluded.free_cash,
-                display_currency = excluded.display_currency,
-                updated_at = excluded.updated_at
-            """,
-            (user["id"], payload.platform, payload.freeCash, payload.displayCurrency, payload.updatedAt),
+        bootstrap_legacy_records_for_user(conn, int(user["id"]))
+        upsert_transaction_record(
+            conn,
+            int(user["id"]),
+            TransactionPayload(
+                id=record_id,
+                kind="balance",
+                platform=payload.platform,
+                cashAmount=payload.freeCash,
+                currency=payload.displayCurrency or get_platform_currency(payload.platform),
+                fxRate=0,
+                occurredAt=payload.updatedAt,
+            ),
         )
+        rebuild_portfolio_from_records(conn, int(user["id"]))
+        row = get_account_balance_entry(conn, int(user["id"]), str(payload.platform or "").strip().lower())
         conn.commit()
-    return {"accountBalance": payload.model_dump()}
+    return {
+        "accountBalance": {
+            "platform": row["platform"] if row else str(payload.platform or "").strip().lower(),
+            "freeCash": row["free_cash"] if row else payload.freeCash,
+            "displayCurrency": row["display_currency"] if row else (payload.displayCurrency or get_platform_currency(payload.platform)),
+            "updatedAt": row["updated_at"] if row else payload.updatedAt,
+        }
+    }
 
 
 @app.delete("/api/account-balances")
 def clear_account_balances(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, str]:
     user = get_current_user(session_cookie)
     with closing(get_db()) as conn:
+        conn.execute("DELETE FROM transactions WHERE user_id = ? AND kind = 'balance'", (int(user["id"]),))
         conn.execute("DELETE FROM account_balances WHERE user_id = ?", (user["id"],))
+        rebuild_portfolio_from_records(conn, int(user["id"]))
         conn.commit()
     return {"message": "ok"}
 

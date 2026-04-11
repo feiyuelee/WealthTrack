@@ -11,6 +11,10 @@ const state = {
   assets: [],
   accountBalances: [],
   transactions: [],
+  entryMode: "asset",
+  transactionMode: "trade",
+  editingTransactionId: "",
+  editingTransactionAsset: null,
   weeklySummary: createEmptyWeeklySummary(),
   settings: {
     finnhubKey: "",
@@ -455,6 +459,13 @@ function bindEvents() {
   if (transactionForm) {
     transactionForm.addEventListener("submit", handleTransactionSubmit);
   }
+  const resetTransactionButton = document.querySelector("#reset-transaction-form-btn");
+  if (resetTransactionButton) {
+    resetTransactionButton.addEventListener("click", resetTransactionForm);
+  }
+  document.querySelectorAll("[data-entry-mode]").forEach((button) => {
+    button.addEventListener("click", handleEntryModeChange);
+  });
   authForm.addEventListener("submit", handleAuthSubmit);
   document.querySelector("#reset-form-btn").addEventListener("click", resetForm);
   document.querySelector("#clear-assets-btn").addEventListener("click", clearAssets);
@@ -627,11 +638,39 @@ async function refreshPortfolioState(options = {}) {
   }
 }
 
+function syncEntryWorkspace() {
+  document.querySelectorAll("[data-entry-mode]").forEach((button) => {
+    const isActive = button.dataset.entryMode === state.entryMode;
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-pressed", isActive ? "true" : "false");
+  });
+  document.querySelectorAll("[data-entry-workspace]").forEach((panel) => {
+    const workspace = panel.dataset.entryWorkspace;
+    const shouldShow = state.entryMode === "asset" ? workspace === "asset" : workspace === "transaction";
+    panel.classList.toggle("hidden", !shouldShow);
+  });
+}
+
+function handleEntryModeChange(event) {
+  const nextMode = event.currentTarget.dataset.entryMode;
+  if (!nextMode) {
+    return;
+  }
+  state.entryMode = nextMode;
+  if (nextMode === "trade" || nextMode === "cash") {
+    state.transactionMode = nextMode;
+  }
+  syncEntryWorkspace();
+  syncTransactionFormByKind();
+}
+
 function render() {
   const filteredAssets = getFilteredAssets();
   renderAccountPrivacyToggle();
   renderDisplayCurrencyBadges();
+  syncEntryWorkspace();
   syncTransactionFormByKind();
+  renderRecordPanelTitle();
   renderSummary(filteredAssets);
   renderWeeklySummary();
   renderTransactionHistory();
@@ -641,6 +680,18 @@ function render() {
   renderTable(filteredAssets);
   renderAssetCards(filteredAssets);
   renderDashboardRiskBanner();
+}
+
+function renderRecordPanelTitle() {
+  const title = document.querySelector("#record-panel-title");
+  if (!title) {
+    return;
+  }
+  title.textContent = state.entryMode === "asset"
+    ? "新增资产记录"
+    : state.entryMode === "trade"
+      ? "买卖记录"
+      : "出入金记录";
 }
 
 function renderDisplayCurrencyBadges() {
@@ -757,14 +808,26 @@ function syncTransactionFormByKind() {
   const cashField = document.querySelector("[data-transaction-cash-field]");
   const cashMetaFields = document.querySelectorAll("[data-transaction-cash-meta-field]");
   const amountLabel = document.querySelector("#transaction-cash-label");
-  const currencyField = document.querySelector("#transaction-currency");
   const assetSelect = document.querySelector("#transaction-asset-id");
-  if (!kindField || !platformField || !currencyField) {
+  if (!kindField || !platformField) {
     return;
   }
 
+  const isTrade = state.transactionMode !== "cash";
+  const kindOptions = isTrade
+    ? [
+        ["buy", "买入"],
+        ["sell", "卖出"]
+      ]
+    : [
+        ["deposit", "入金"],
+        ["withdraw", "出金"]
+      ];
+  const previousKind = kindField.value;
+  kindField.innerHTML = kindOptions.map(([value, label]) => `<option value="${value}">${label}</option>`).join("");
+  kindField.value = kindOptions.some(([value]) => value === previousKind) ? previousKind : kindOptions[0][0];
   const kind = kindField.value;
-  const isTrade = kind === "buy" || kind === "sell";
+  const previousAssetId = assetSelect ? assetSelect.value : "";
   if (form) {
     form.classList.toggle("transaction-form--trade", isTrade);
     form.classList.toggle("transaction-form--cash", !isTrade);
@@ -785,9 +848,15 @@ function syncTransactionFormByKind() {
     const assets = state.assets
       .filter((asset) => !["cash", "liability"].includes(asset.type))
       .sort((left, right) => String(left.name || left.symbol).localeCompare(String(right.name || right.symbol), "zh-CN"));
+    if (state.editingTransactionAsset && !assets.some((asset) => asset.id === state.editingTransactionAsset.id || (asset.platform === state.editingTransactionAsset.platform && asset.type === state.editingTransactionAsset.type && asset.symbol === state.editingTransactionAsset.symbol))) {
+      assets.unshift(state.editingTransactionAsset);
+    }
     assetSelect.innerHTML = assets.length
       ? assets.map((asset) => `<option value="${escapeHtml(asset.id)}">${escapeHtml(asset.name)} · ${escapeHtml(asset.symbol)} · ${escapeHtml(String(asset.platform || "").toUpperCase())}</option>`).join("")
       : '<option value="">暂无可交易资产</option>';
+    if (previousAssetId && assets.some((asset) => asset.id === previousAssetId)) {
+      assetSelect.value = previousAssetId;
+    }
   }
   syncTransactionAssetSelection();
 }
@@ -795,16 +864,66 @@ function syncTransactionFormByKind() {
 function syncTransactionAssetSelection() {
   const assetSelect = document.querySelector("#transaction-asset-id");
   const platformField = document.querySelector("#transaction-platform");
-  const currencyField = document.querySelector("#transaction-currency");
   if (!assetSelect) {
     return;
   }
   const asset = state.assets.find((item) => item.id === assetSelect.value);
-  if (platformField && asset?.platform) {
+  if (state.transactionMode !== "cash" && platformField && asset?.platform) {
     platformField.value = asset.platform;
   }
-  if (currencyField && asset?.currency) {
-    currencyField.value = asset.currency;
+}
+
+function fillTransactionFormFromRecord(record) {
+  state.editingTransactionId = record.id;
+  state.editingTransactionAsset = record.kind === "buy" || record.kind === "sell"
+    ? {
+        id: `record:${record.id}`,
+        name: record.assetName || record.symbol,
+        platform: record.platform,
+        type: record.assetType,
+        symbol: record.symbol,
+        currency: record.currency,
+        quoteSource: record.quoteSource,
+        quoteDate: record.quoteDate
+      }
+    : null;
+  state.entryMode = record.kind === "deposit" || record.kind === "withdraw" ? "cash" : "trade";
+  state.transactionMode = state.entryMode;
+  syncEntryWorkspace();
+  syncTransactionFormByKind();
+
+  const kindField = document.querySelector("#transaction-kind");
+  const platformField = document.querySelector("#transaction-platform");
+  const assetField = document.querySelector("#transaction-asset-id");
+  const quantityField = document.querySelector("#transaction-quantity");
+  const priceField = document.querySelector("#transaction-price");
+  const feeField = document.querySelector("#transaction-fee");
+  const cashAmountField = document.querySelector("#transaction-cash-amount");
+
+  if (kindField) {
+    kindField.value = record.kind;
+  }
+  if (platformField) {
+    platformField.value = record.platform || "ibkr";
+  }
+  if (assetField && (record.kind === "buy" || record.kind === "sell")) {
+    const matchedAsset = state.assets.find((item) => item.id === record.id)
+      || state.assets.find((item) => item.platform === record.platform && item.type === record.assetType && item.symbol === record.symbol);
+    if (matchedAsset) {
+      assetField.value = matchedAsset.id;
+    }
+  }
+  if (quantityField) {
+    quantityField.value = record.quantity || "";
+  }
+  if (priceField) {
+    priceField.value = record.price || "";
+  }
+  if (feeField) {
+    feeField.value = record.fee || 0;
+  }
+  if (cashAmountField) {
+    cashAmountField.value = Math.abs(Number(record.cashAmount) || 0) || "";
   }
 }
 
@@ -814,6 +933,9 @@ function resetTransactionForm() {
     return;
   }
   form.reset();
+  state.editingTransactionId = "";
+  state.editingTransactionAsset = null;
+  state.transactionMode = state.entryMode === "cash" ? "cash" : "trade";
   const platformField = document.querySelector("#transaction-platform");
   if (platformField && !platformField.value) {
     platformField.value = "ibkr";
@@ -821,31 +943,115 @@ function resetTransactionForm() {
   syncTransactionFormByKind();
 }
 
+async function handleRecordAction(event) {
+  const action = event.currentTarget.dataset.recordAction;
+  const id = event.currentTarget.dataset.id;
+  const record = state.transactions.find((item) => item.id === id);
+  if (!record) {
+    return;
+  }
+
+  if (action === "edit") {
+    if (record.kind === "asset") {
+      state.entryMode = "asset";
+      fillForm({
+        id: record.id,
+        name: record.assetName,
+        platform: record.platform,
+        type: record.assetType,
+        symbol: record.symbol,
+        quantity: record.quantity,
+        costPrice: record.costPrice,
+        currentPrice: record.currentPrice,
+        previousClose: record.previousClose,
+        currency: record.currency,
+        fxRate: record.fxRate,
+        quoteSource: record.quoteSource,
+        quoteDate: record.quoteDate,
+        quoteFetchedAt: record.createdAt || record.occurredAt,
+        notes: record.notes || ""
+      });
+      syncEntryWorkspace();
+      switchView("entry");
+      window.scrollTo({ top: 0, behavior: "smooth" });
+      showToast(`正在编辑 ${record.assetName || record.symbol}`);
+      return;
+    }
+
+    fillTransactionFormFromRecord(record);
+    switchView("entry");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    showToast("已载入记录，可直接修改");
+    return;
+  }
+
+  const label = record.kind === "asset" ? (record.assetName || record.symbol) : (record.assetName || record.symbol || getPlatformLabel(record.platform));
+  if (!window.confirm(`确定删除这条记录吗？\n${label}`)) {
+    return;
+  }
+  await apiFetch(`/api/transactions/${encodeURIComponent(record.id)}`, { method: "DELETE" });
+  await refreshPortfolioState({ renderAfter: false });
+  resetForm();
+  resetTransactionForm();
+  render();
+  showToast("记录已删除");
+}
+
 function renderTransactionHistory() {
   const container = document.querySelector("#transaction-history");
   if (!container) {
     return;
   }
-  if (!state.transactions.length) {
-    container.innerHTML = '<p class="transaction-history__empty">还没有交易记录。</p>';
+  const records = state.transactions
+    .filter((item) => item.kind !== "balance")
+    .filter((item) => {
+      if (state.entryMode === "asset") {
+        return item.kind === "asset";
+      }
+      if (state.entryMode === "trade") {
+        return item.kind === "buy" || item.kind === "sell";
+      }
+      if (state.entryMode === "cash") {
+        return item.kind === "deposit" || item.kind === "withdraw";
+      }
+      return true;
+    });
+  if (!records.length) {
+    const emptyText = state.entryMode === "asset"
+      ? "还没有新增资产记录。"
+      : state.entryMode === "trade"
+        ? "还没有买卖记录。"
+        : "还没有出入金记录。";
+    container.innerHTML = `<p class="transaction-history__empty">${emptyText}</p>`;
     return;
   }
 
-  container.innerHTML = state.transactions
-    .slice(0, 12)
+  container.innerHTML = records
+    .slice(0, 20)
     .map((item) => {
       const cashValueCny = (Number(item.cashAmount) || 0) * (Number(item.fxRate) || 1);
       const realizedProfitCny = (Number(item.realizedProfit) || 0) * (Number(item.fxRate) || 1);
-      const title = item.kind === "buy"
-        ? `买入 ${item.assetName || item.symbol}`
-        : item.kind === "sell"
-          ? `卖出 ${item.assetName || item.symbol}`
-          : item.kind === "deposit"
-            ? "入金"
-            : "出金";
+      const title = item.kind === "asset"
+        ? `新增资产 ${item.assetName || item.symbol}`
+        : item.kind === "buy"
+          ? `买入 ${item.assetName || item.symbol}`
+          : item.kind === "sell"
+            ? `卖出 ${item.assetName || item.symbol}`
+            : item.kind === "deposit"
+              ? "平台入金"
+              : "平台出金";
       const meta = [getPlatformLabel(item.platform), item.symbol || item.currency, item.occurredAt ? new Date(item.occurredAt).toLocaleString("zh-CN") : ""]
         .filter(Boolean)
         .join(" · ");
+      const valueMarkup = item.kind === "asset"
+        ? `<strong>${formatCurrency(getCurrentValue({
+            quantity: Number(item.quantity) || 0,
+            currentPrice: Number(item.currentPrice) || 0,
+            fxRate: Number(item.fxRate) || 1,
+            type: item.assetType || "fund"
+          }))}</strong>`
+        : `<strong class="${getToneClass(cashValueCny)}">${formatCurrency(cashValueCny)}</strong>
+           ${item.kind === "sell" ? `<small class="${getToneClass(realizedProfitCny)}">已实现 ${formatCurrency(realizedProfitCny)}</small>` : ""}`;
       return `
         <article class="transaction-item">
           <div>
@@ -853,13 +1059,20 @@ function renderTransactionHistory() {
             <small>${escapeHtml(meta)}</small>
           </div>
           <div class="transaction-item__values">
-            <strong class="${getToneClass(cashValueCny)}">${formatCurrency(cashValueCny)}</strong>
-            ${item.kind === "sell" ? `<small class="${getToneClass(realizedProfitCny)}">已实现 ${formatCurrency(realizedProfitCny)}</small>` : ""}
+            ${valueMarkup}
+          </div>
+          <div class="transaction-item__actions">
+            <button type="button" class="ghost-button" data-record-action="edit" data-id="${escapeHtml(item.id)}">编辑</button>
+            <button type="button" class="ghost-button danger-ghost-button" data-record-action="delete" data-id="${escapeHtml(item.id)}">删除</button>
           </div>
         </article>
       `;
     })
     .join("");
+
+  container.querySelectorAll("[data-record-action]").forEach((button) => {
+    button.addEventListener("click", handleRecordAction);
+  });
 }
 
 async function handleTransactionSubmit(event) {
@@ -871,8 +1084,9 @@ async function handleTransactionSubmit(event) {
   const kind = String(document.querySelector("#transaction-kind")?.value || "").trim();
   const platform = String(document.querySelector("#transaction-platform")?.value || "").trim();
   const selectedAssetId = String(document.querySelector("#transaction-asset-id")?.value || "").trim();
-  const selectedAsset = state.assets.find((item) => item.id === selectedAssetId) || null;
-  const currency = String(document.querySelector("#transaction-currency")?.value || selectedAsset?.currency || getPlatformCurrency(platform)).trim().toUpperCase();
+  const selectedAsset = state.assets.find((item) => item.id === selectedAssetId)
+    || (state.editingTransactionAsset && state.editingTransactionAsset.id === selectedAssetId ? state.editingTransactionAsset : null);
+  const currency = String(selectedAsset?.currency || getPlatformCurrency(platform)).trim().toUpperCase();
   if (currency !== "CNY") {
     try {
       await ensureFxRateCached(currency);
@@ -882,7 +1096,7 @@ async function handleTransactionSubmit(event) {
     }
   }
   const payload = {
-    id: crypto.randomUUID(),
+    id: state.editingTransactionId || crypto.randomUUID(),
     kind,
     platform,
     assetName: selectedAsset?.name || "",
@@ -913,14 +1127,15 @@ async function handleTransactionSubmit(event) {
     return;
   }
 
-  await apiFetch("/api/transactions", {
-    method: "POST",
+  const isEditingTransaction = Boolean(state.editingTransactionId);
+  await apiFetch(isEditingTransaction ? `/api/transactions/${encodeURIComponent(state.editingTransactionId)}` : "/api/transactions", {
+    method: isEditingTransaction ? "PUT" : "POST",
     body: JSON.stringify(payload)
   });
   await refreshPortfolioState({ renderAfter: false });
   resetTransactionForm();
   render();
-  showToast(payload.kind === "buy" || payload.kind === "sell" ? "交易已记录并同步持仓" : "资金流水已记录");
+  showToast(isEditingTransaction ? "记录已更新" : (payload.kind === "buy" || payload.kind === "sell" ? "交易已记录并同步持仓" : "资金流水已记录"));
 }
 
 function renderPlatformSummary(assets) {
@@ -1106,20 +1321,10 @@ async function handleSubmit(event) {
     method: "POST",
     body: JSON.stringify(asset)
   });
-
-  const nextAsset = saved.asset;
-  const existingIndex = state.assets.findIndex((item) => item.id === nextAsset.id);
-  if (existingIndex >= 0) {
-    state.assets[existingIndex] = nextAsset;
-    showToast("资产已更新");
-  } else {
-    state.assets.unshift(nextAsset);
-    showToast("资产已保存");
-  }
-
-  await refreshWeeklySummary({ renderAfter: false });
+  await refreshPortfolioState({ renderAfter: false });
   resetForm();
   render();
+  showToast(saved.asset ? "资产记录已保存" : "资产已保存");
 }
 
 async function handleAuthSubmit(event) {
@@ -1193,8 +1398,10 @@ async function handleAssetAction(event) {
   }
 
   if (action === "edit") {
+    state.entryMode = "asset";
     fillForm(asset);
     switchView("entry");
+    syncEntryWorkspace();
     window.scrollTo({ top: 0, behavior: "smooth" });
     showToast(`正在编辑 ${asset.name}`);
     return;
@@ -1215,21 +1422,20 @@ async function clearAssets() {
   if (!ensureLoggedIn()) {
     return;
   }
-  if (!state.assets.length) {
-    showToast("当前没有资产数据");
+  if (!state.assets.length && !state.transactions.length && !state.accountBalances.length) {
+    showToast("当前没有可清理的数据");
     return;
   }
-  if (!window.confirm("确定要清空全部资产吗？")) {
+  if (!window.confirm("确定要清空全部记录、资产和账户资金吗？")) {
     return;
   }
-
-  for (const asset of [...state.assets]) {
-    await apiFetch(`/api/assets/${encodeURIComponent(asset.id)}`, { method: "DELETE" });
-  }
+  await apiFetch("/api/records", { method: "DELETE" });
   state.assets = [];
-  await refreshWeeklySummary({ renderAfter: false });
+  state.transactions = [];
+  state.accountBalances = [];
+  state.weeklySummary = createEmptyWeeklySummary();
   render();
-  showToast("全部资产已清空");
+  showToast("全部记录已清空");
 }
 
 function exportAssets() {
@@ -1280,11 +1486,9 @@ async function handleImportAssets(event) {
 
     const shouldReplace = window.confirm("是否先清空当前资产，再导入文件中的资产？点击“取消”则直接合并导入。");
     if (shouldReplace) {
-      for (const asset of [...state.assets]) {
-        await apiFetch(`/api/assets/${encodeURIComponent(asset.id)}`, { method: "DELETE" });
-      }
-      await apiFetch("/api/account-balances", { method: "DELETE" });
+      await apiFetch("/api/records", { method: "DELETE" });
       state.assets = [];
+      state.transactions = [];
       state.accountBalances = [];
     }
 
@@ -1317,6 +1521,7 @@ async function handleImportAssets(event) {
       }
     }
 
+    await refreshPortfolioState({ renderAfter: false });
     render();
     showToast(`已导入 ${importedCount} 条资产`);
   } catch (error) {

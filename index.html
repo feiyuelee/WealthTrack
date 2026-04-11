@@ -196,6 +196,14 @@
 
       <section class="view-panel" data-view="entry">
         <section class="panel">
+          <div class="entry-action-tabs" role="tablist" aria-label="录入动作">
+            <button type="button" class="entry-action-tabs__button is-active" data-entry-mode="asset">新增资产</button>
+            <button type="button" class="entry-action-tabs__button" data-entry-mode="trade">买卖资产</button>
+            <button type="button" class="entry-action-tabs__button" data-entry-mode="cash">平台出入金</button>
+          </div>
+        </section>
+
+        <section class="panel" data-entry-workspace="asset">
           <div class="panel-header">
             <div>
               <p class="section-tag">录入</p>
@@ -296,7 +304,7 @@
           </form>
         </section>
 
-        <section class="panel">
+        <section class="panel" data-entry-workspace="transaction">
           <div class="panel-header">
             <div>
               <p class="section-tag">交易</p>
@@ -350,13 +358,6 @@
                   <option value="other">其他</option>
                 </select>
               </label>
-              <label data-transaction-cash-meta-field>
-                <span>币种</span>
-                <select id="transaction-currency">
-                  <option value="CNY">CNY</option>
-                  <option value="USD">USD</option>
-                </select>
-              </label>
             </div>
 
             <div class="form-row" data-transaction-cash-field>
@@ -368,9 +369,18 @@
 
             <div class="form-actions">
               <button type="submit" class="primary-button">记录交易</button>
+              <button type="button" class="ghost-button" id="reset-transaction-form-btn">重置</button>
             </div>
           </form>
+        </section>
 
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-tag">记录</p>
+              <h2 id="record-panel-title">操作记录</h2>
+            </div>
+          </div>
           <div id="transaction-history" class="transaction-history"></div>
         </section>
       </section>

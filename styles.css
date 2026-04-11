@@ -808,6 +808,32 @@ th {
   gap: 12px;
 }
 
+.entry-action-tabs {
+  display: inline-flex;
+  gap: 10px;
+  margin: 0;
+  padding: 6px;
+  border-radius: 999px;
+  background: rgba(184, 92, 56, 0.08);
+}
+
+.entry-action-tabs__button {
+  border: 0;
+  border-radius: 999px;
+  padding: 10px 16px;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.entry-action-tabs__button.is-active {
+  background: linear-gradient(135deg, #c4693f 0%, #b55832 100%);
+  color: #fffaf6;
+  box-shadow: 0 10px 18px rgba(181, 88, 50, 0.24);
+}
+
 .transaction-form {
   --transaction-field-width: 250px;
   margin-top: 22px;
@@ -865,9 +891,9 @@ th {
 }
 
 .transaction-item {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
-  justify-content: space-between;
   gap: 16px;
   padding: 14px 16px;
   border-radius: 18px;
@@ -886,6 +912,19 @@ th {
 
 .transaction-item__values {
   text-align: right;
+}
+
+.transaction-item__actions {
+  display: inline-flex;
+  gap: 10px;
+}
+
+.transaction-item__actions .ghost-button {
+  min-width: 72px;
+}
+
+.danger-ghost-button {
+  color: #b84b4b;
 }
 
 .account-summary-card__title {
