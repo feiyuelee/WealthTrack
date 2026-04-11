@@ -53,6 +53,13 @@ function createEmptyWeeklySummary() {
   };
 }
 
+function createClientId() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+  return `id-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
 init();
 
 async function init() {
@@ -1138,7 +1145,7 @@ async function handleTransactionSubmit(event) {
     }
   }
   const payload = {
-    id: state.editingTransactionId || crypto.randomUUID(),
+    id: state.editingTransactionId || createClientId(),
     kind,
     platform,
     assetName: selectedAsset?.name || "",
@@ -1343,7 +1350,7 @@ async function handleSubmit(event) {
   const existingAsset = state.assets.find((item) => item.id === formData.get("id"));
   const latestPriceField = document.querySelector("#asset-price");
   const asset = {
-    id: formData.get("id") || crypto.randomUUID(),
+    id: formData.get("id") || createClientId(),
     name: String(formData.get("name")).trim(),
     platform: String(formData.get("platform")),
     type: String(formData.get("type")),
@@ -1602,7 +1609,7 @@ function normalizeImportedAsset(rawAsset) {
   }
 
   return {
-    id: String(rawAsset.id || crypto.randomUUID()),
+    id: String(rawAsset.id || createClientId()),
     name: String(rawAsset.name).trim(),
     platform,
     type,
@@ -1843,7 +1850,7 @@ async function autoFillLatestPrice() {
   }
 
   const payload = {
-    id: document.querySelector("#asset-id").value || crypto.randomUUID(),
+    id: document.querySelector("#asset-id").value || createClientId(),
     name: document.querySelector("#asset-name").value.trim() || rawSymbol,
     platform,
     type,
