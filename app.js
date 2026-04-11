@@ -460,6 +460,10 @@ function bindEvents() {
   if (transactionForm) {
     transactionForm.addEventListener("submit", handleTransactionSubmit);
   }
+  const submitTransactionButton = document.querySelector("#submit-transaction-form-btn");
+  if (submitTransactionButton) {
+    submitTransactionButton.addEventListener("click", handleTransactionSubmit);
+  }
   const resetTransactionButton = document.querySelector("#reset-transaction-form-btn");
   if (resetTransactionButton) {
     resetTransactionButton.addEventListener("click", resetTransactionForm);
@@ -1110,7 +1114,7 @@ function renderTransactionHistory() {
 }
 
 async function handleTransactionSubmit(event) {
-  event.preventDefault();
+  event?.preventDefault?.();
   if (!ensureLoggedIn()) {
     return;
   }

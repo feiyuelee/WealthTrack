@@ -311,7 +311,7 @@
               <h2>买卖与资金流水</h2>
             </div>
           </div>
-          <form id="transaction-form" class="asset-form transaction-form">
+          <form id="transaction-form" class="asset-form transaction-form" novalidate>
             <div class="form-row transaction-form__asset-row" data-transaction-asset-field>
               <label class="transaction-form__asset-field">
                 <span>平台</span>
@@ -372,7 +372,7 @@
             </div>
 
             <div class="form-actions">
-              <button type="submit" class="primary-button">记录交易</button>
+              <button type="button" class="primary-button" id="submit-transaction-form-btn">记录交易</button>
               <button type="button" class="ghost-button" id="reset-transaction-form-btn">重置</button>
             </div>
           </form>
