@@ -10,6 +10,7 @@ const state = {
   user: null,
   assets: [],
   accountBalances: [],
+  transactions: [],
   weeklySummary: createEmptyWeeklySummary(),
   settings: {
     finnhubKey: "",
@@ -40,6 +41,7 @@ function createEmptyWeeklySummary() {
     baselineDate: "",
     baselineTotalAssets: 0,
     currentTotalAssets: 0,
+    netExternalFlow: 0,
     profit: 0,
     profitRate: 0,
     isPartial: false
@@ -53,6 +55,7 @@ async function init() {
   bindEvents();
   syncSettingsAccess();
   resetForm();
+  syncTransactionFormByKind();
   render();
   await bootstrapSession();
 }
@@ -448,6 +451,10 @@ function mountGlobalToolbar() {
 
 function bindEvents() {
   form.addEventListener("submit", handleSubmit);
+  const transactionForm = document.querySelector("#transaction-form");
+  if (transactionForm) {
+    transactionForm.addEventListener("submit", handleTransactionSubmit);
+  }
   authForm.addEventListener("submit", handleAuthSubmit);
   document.querySelector("#reset-form-btn").addEventListener("click", resetForm);
   document.querySelector("#clear-assets-btn").addEventListener("click", clearAssets);
@@ -477,6 +484,18 @@ function bindEvents() {
   document.querySelector("#asset-symbol").addEventListener("input", validateAssetSymbolCompatibility);
   document.querySelector("#asset-symbol").addEventListener("blur", autoFillLatestPrice);
   document.querySelector("#display-currency").addEventListener("change", handleDisplayCurrencyChange);
+  const transactionKind = document.querySelector("#transaction-kind");
+  if (transactionKind) {
+    transactionKind.addEventListener("change", syncTransactionFormByKind);
+  }
+  const transactionPlatform = document.querySelector("#transaction-platform");
+  if (transactionPlatform) {
+    transactionPlatform.addEventListener("change", syncTransactionFormByKind);
+  }
+  const transactionAssetSelect = document.querySelector("#transaction-asset-id");
+  if (transactionAssetSelect) {
+    transactionAssetSelect.addEventListener("change", syncTransactionAssetSelection);
+  }
   const accountPrivacyToggle = document.querySelector("#account-privacy-toggle");
   if (accountPrivacyToggle) {
     accountPrivacyToggle.addEventListener("click", toggleAccountValuesVisibility);
@@ -537,15 +556,17 @@ async function bootstrapSession() {
 }
 
 async function loadServerData() {
-  const [assetsResponse, settingsResponse, accountBalancesResponse] = await Promise.all([
+  const [assetsResponse, settingsResponse, accountBalancesResponse, transactionsResponse] = await Promise.all([
     apiFetch("/api/assets"),
     apiFetch("/api/settings"),
-    apiFetch("/api/account-balances")
+    apiFetch("/api/account-balances"),
+    apiFetch("/api/transactions")
   ]);
 
   state.assets = assetsResponse.assets;
   state.settings = settingsResponse.settings;
   state.accountBalances = accountBalancesResponse.accountBalances || [];
+  state.transactions = transactionsResponse.transactions || [];
   state.weeklySummary = createEmptyWeeklySummary();
   state.accountOverviewCurrency = inferAccountOverviewCurrency();
   hydrateSettings();
@@ -577,12 +598,43 @@ async function loadServerData() {
   render();
 }
 
+async function refreshPortfolioState(options = {}) {
+  const { renderAfter = true } = options;
+  if (!state.user) {
+    state.assets = [];
+    state.accountBalances = [];
+    state.transactions = [];
+    state.weeklySummary = createEmptyWeeklySummary();
+    if (renderAfter) {
+      render();
+    }
+    return;
+  }
+
+  const [assetsResponse, accountBalancesResponse, transactionsResponse] = await Promise.all([
+    apiFetch("/api/assets"),
+    apiFetch("/api/account-balances"),
+    apiFetch("/api/transactions")
+  ]);
+
+  state.assets = assetsResponse.assets || [];
+  state.accountBalances = accountBalancesResponse.accountBalances || [];
+  state.transactions = transactionsResponse.transactions || [];
+  state.accountOverviewCurrency = inferAccountOverviewCurrency();
+  await refreshWeeklySummary({ renderAfter: false });
+  if (renderAfter) {
+    render();
+  }
+}
+
 function render() {
   const filteredAssets = getFilteredAssets();
   renderAccountPrivacyToggle();
   renderDisplayCurrencyBadges();
+  syncTransactionFormByKind();
   renderSummary(filteredAssets);
   renderWeeklySummary();
+  renderTransactionHistory();
   renderHomepageAssetDistribution(filteredAssets);
   renderHomepagePlatformProfit(filteredAssets);
   renderPlatformSummary(filteredAssets);
@@ -695,6 +747,180 @@ async function refreshWeeklySummary(options = {}) {
   if (renderAfter) {
     renderWeeklySummary();
   }
+}
+
+function syncTransactionFormByKind() {
+  const form = document.querySelector("#transaction-form");
+  const kindField = document.querySelector("#transaction-kind");
+  const platformField = document.querySelector("#transaction-platform");
+  const assetFields = document.querySelectorAll("[data-transaction-asset-field]");
+  const cashField = document.querySelector("[data-transaction-cash-field]");
+  const cashMetaFields = document.querySelectorAll("[data-transaction-cash-meta-field]");
+  const amountLabel = document.querySelector("#transaction-cash-label");
+  const currencyField = document.querySelector("#transaction-currency");
+  const assetSelect = document.querySelector("#transaction-asset-id");
+  if (!kindField || !platformField || !currencyField) {
+    return;
+  }
+
+  const kind = kindField.value;
+  const isTrade = kind === "buy" || kind === "sell";
+  if (form) {
+    form.classList.toggle("transaction-form--trade", isTrade);
+    form.classList.toggle("transaction-form--cash", !isTrade);
+  }
+  assetFields.forEach((element) => {
+    element.classList.toggle("hidden", !isTrade);
+  });
+  cashMetaFields.forEach((element) => {
+    element.classList.toggle("hidden", isTrade);
+  });
+  if (cashField) {
+    cashField.classList.toggle("hidden", isTrade);
+  }
+  if (amountLabel) {
+    amountLabel.textContent = kind === "deposit" ? "入金金额" : "出金金额";
+  }
+  if (assetSelect) {
+    const assets = state.assets
+      .filter((asset) => !["cash", "liability"].includes(asset.type))
+      .sort((left, right) => String(left.name || left.symbol).localeCompare(String(right.name || right.symbol), "zh-CN"));
+    assetSelect.innerHTML = assets.length
+      ? assets.map((asset) => `<option value="${escapeHtml(asset.id)}">${escapeHtml(asset.name)} · ${escapeHtml(asset.symbol)} · ${escapeHtml(String(asset.platform || "").toUpperCase())}</option>`).join("")
+      : '<option value="">暂无可交易资产</option>';
+  }
+  syncTransactionAssetSelection();
+}
+
+function syncTransactionAssetSelection() {
+  const assetSelect = document.querySelector("#transaction-asset-id");
+  const platformField = document.querySelector("#transaction-platform");
+  const currencyField = document.querySelector("#transaction-currency");
+  if (!assetSelect) {
+    return;
+  }
+  const asset = state.assets.find((item) => item.id === assetSelect.value);
+  if (platformField && asset?.platform) {
+    platformField.value = asset.platform;
+  }
+  if (currencyField && asset?.currency) {
+    currencyField.value = asset.currency;
+  }
+}
+
+function resetTransactionForm() {
+  const form = document.querySelector("#transaction-form");
+  if (!form) {
+    return;
+  }
+  form.reset();
+  const platformField = document.querySelector("#transaction-platform");
+  if (platformField && !platformField.value) {
+    platformField.value = "ibkr";
+  }
+  syncTransactionFormByKind();
+}
+
+function renderTransactionHistory() {
+  const container = document.querySelector("#transaction-history");
+  if (!container) {
+    return;
+  }
+  if (!state.transactions.length) {
+    container.innerHTML = '<p class="transaction-history__empty">还没有交易记录。</p>';
+    return;
+  }
+
+  container.innerHTML = state.transactions
+    .slice(0, 12)
+    .map((item) => {
+      const cashValueCny = (Number(item.cashAmount) || 0) * (Number(item.fxRate) || 1);
+      const realizedProfitCny = (Number(item.realizedProfit) || 0) * (Number(item.fxRate) || 1);
+      const title = item.kind === "buy"
+        ? `买入 ${item.assetName || item.symbol}`
+        : item.kind === "sell"
+          ? `卖出 ${item.assetName || item.symbol}`
+          : item.kind === "deposit"
+            ? "入金"
+            : "出金";
+      const meta = [getPlatformLabel(item.platform), item.symbol || item.currency, item.occurredAt ? new Date(item.occurredAt).toLocaleString("zh-CN") : ""]
+        .filter(Boolean)
+        .join(" · ");
+      return `
+        <article class="transaction-item">
+          <div>
+            <strong>${escapeHtml(title)}</strong>
+            <small>${escapeHtml(meta)}</small>
+          </div>
+          <div class="transaction-item__values">
+            <strong class="${getToneClass(cashValueCny)}">${formatCurrency(cashValueCny)}</strong>
+            ${item.kind === "sell" ? `<small class="${getToneClass(realizedProfitCny)}">已实现 ${formatCurrency(realizedProfitCny)}</small>` : ""}
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+}
+
+async function handleTransactionSubmit(event) {
+  event.preventDefault();
+  if (!ensureLoggedIn()) {
+    return;
+  }
+
+  const kind = String(document.querySelector("#transaction-kind")?.value || "").trim();
+  const platform = String(document.querySelector("#transaction-platform")?.value || "").trim();
+  const selectedAssetId = String(document.querySelector("#transaction-asset-id")?.value || "").trim();
+  const selectedAsset = state.assets.find((item) => item.id === selectedAssetId) || null;
+  const currency = String(document.querySelector("#transaction-currency")?.value || selectedAsset?.currency || getPlatformCurrency(platform)).trim().toUpperCase();
+  if (currency !== "CNY") {
+    try {
+      await ensureFxRateCached(currency);
+    } catch (error) {
+      showToast(error.message || "获取汇率失败");
+      return;
+    }
+  }
+  const payload = {
+    id: crypto.randomUUID(),
+    kind,
+    platform,
+    assetName: selectedAsset?.name || "",
+    assetType: selectedAsset?.type || "",
+    symbol: selectedAsset?.symbol || "",
+    quantity: Number(document.querySelector("#transaction-quantity")?.value) || 0,
+    price: Number(document.querySelector("#transaction-price")?.value) || 0,
+    fee: Number(document.querySelector("#transaction-fee")?.value) || 0,
+    cashAmount: Number(document.querySelector("#transaction-cash-amount")?.value) || 0,
+    currency,
+    fxRate: getCurrencyFxRateToCny(currency),
+    quoteSource: selectedAsset?.quoteSource || "manual",
+    quoteDate: selectedAsset?.quoteDate || "",
+    notes: "",
+    occurredAt: new Date().toISOString()
+  };
+
+  if (!payload.kind || !payload.platform) {
+    showToast("请先选择交易类型和平台");
+    return;
+  }
+  if ((payload.kind === "buy" || payload.kind === "sell") && (!selectedAsset || payload.quantity <= 0 || payload.price <= 0)) {
+    showToast("买卖交易请先从已有资产中选择一项，并填写数量和价格");
+    return;
+  }
+  if ((payload.kind === "deposit" || payload.kind === "withdraw") && payload.cashAmount <= 0) {
+    showToast("入金或出金金额必须大于 0");
+    return;
+  }
+
+  await apiFetch("/api/transactions", {
+    method: "POST",
+    body: JSON.stringify(payload)
+  });
+  await refreshPortfolioState({ renderAfter: false });
+  resetTransactionForm();
+  render();
+  showToast(payload.kind === "buy" || payload.kind === "sell" ? "交易已记录并同步持仓" : "资金流水已记录");
 }
 
 function renderPlatformSummary(assets) {
@@ -940,6 +1166,7 @@ async function logout() {
   state.user = null;
   state.assets = [];
   state.accountBalances = [];
+  state.transactions = [];
   state.weeklySummary = createEmptyWeeklySummary();
   state.accountOverviewCurrency = "CNY";
     state.settings = {
@@ -953,6 +1180,7 @@ async function logout() {
   updateAuthUI();
   lockAppForGuest();
   resetForm();
+  resetTransactionForm();
   render();
   showToast("已退出登录");
 }

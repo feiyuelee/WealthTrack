@@ -802,6 +802,92 @@ th {
   text-align: right;
 }
 
+.transaction-history {
+  margin-top: 20px;
+  display: grid;
+  gap: 12px;
+}
+
+.transaction-form {
+  --transaction-field-width: 250px;
+  margin-top: 22px;
+  max-width: 780px;
+  padding: 20px 20px 16px;
+  border-radius: 26px;
+  background: linear-gradient(180deg, rgba(255, 251, 246, 0.88) 0%, rgba(251, 244, 235, 0.74) 100%);
+  border: 1px solid rgba(215, 194, 171, 0.42);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.72);
+}
+
+.transaction-form__top-row {
+  grid-template-columns: repeat(2, minmax(0, var(--transaction-field-width)));
+  align-items: start;
+  gap: 18px;
+}
+
+.transaction-form--trade .transaction-form__top-row {
+  grid-template-columns: repeat(2, minmax(0, var(--transaction-field-width)));
+}
+
+.transaction-form__asset-row {
+  grid-template-columns: minmax(0, var(--transaction-field-width));
+}
+
+.transaction-form__stack {
+  display: grid;
+  gap: 16px;
+}
+
+.transaction-form__asset-field {
+  min-width: 0;
+}
+
+.transaction-form__asset-field select {
+  font-weight: 600;
+  font-size: 1rem;
+}
+
+.transaction-form .form-actions {
+  margin-top: 10px;
+}
+
+.transaction-form .primary-button {
+  min-width: 132px;
+}
+
+.transaction-form label > span {
+  font-weight: 600;
+}
+
+.transaction-history__empty {
+  margin: 0;
+  color: var(--muted);
+}
+
+.transaction-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  border-radius: 18px;
+  border: 1px solid rgba(210, 191, 171, 0.42);
+  background: rgba(255, 251, 246, 0.86);
+}
+
+.transaction-item strong,
+.transaction-item small {
+  display: block;
+}
+
+.transaction-item small {
+  color: var(--muted);
+}
+
+.transaction-item__values {
+  text-align: right;
+}
+
 .account-summary-card__title {
   display: flex;
   align-items: center;

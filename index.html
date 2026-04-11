@@ -295,6 +295,84 @@
             </div>
           </form>
         </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <div>
+              <p class="section-tag">交易</p>
+              <h2>买卖与资金流水</h2>
+            </div>
+          </div>
+          <form id="transaction-form" class="asset-form transaction-form">
+            <div class="form-row transaction-form__asset-row" data-transaction-asset-field>
+              <label class="transaction-form__asset-field">
+                <span>已有资产</span>
+                <select id="transaction-asset-id"></select>
+              </label>
+            </div>
+
+            <div class="form-row transaction-form__top-row">
+              <div class="transaction-form__stack">
+                <label>
+                  <span>交易类型</span>
+                  <select id="transaction-kind">
+                    <option value="buy">买入</option>
+                    <option value="sell">卖出</option>
+                    <option value="deposit">入金</option>
+                    <option value="withdraw">出金</option>
+                  </select>
+                </label>
+                <label data-transaction-asset-field>
+                  <span>数量</span>
+                  <input id="transaction-quantity" type="number" min="0" step="0.000001">
+                </label>
+              </div>
+              <div class="transaction-form__stack" data-transaction-asset-field>
+                <label>
+                  <span>成交价</span>
+                  <input id="transaction-price" type="number" min="0" step="0.000001">
+                </label>
+                <label>
+                  <span>手续费</span>
+                  <input id="transaction-fee" type="number" min="0" step="0.01" value="0">
+                </label>
+              </div>
+              <label data-transaction-cash-meta-field>
+                <span>平台</span>
+                <select id="transaction-platform">
+                  <option value="alipay">支付宝</option>
+                  <option value="southfund">南方基金</option>
+                  <option value="tonghuashun">同花顺</option>
+                  <option value="okx">欧意 OKX</option>
+                  <option value="ibkr" selected>IBKR</option>
+                  <option value="schwab">嘉信理财</option>
+                  <option value="bank">现金 / 银行</option>
+                  <option value="other">其他</option>
+                </select>
+              </label>
+              <label data-transaction-cash-meta-field>
+                <span>币种</span>
+                <select id="transaction-currency">
+                  <option value="CNY">CNY</option>
+                  <option value="USD">USD</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="form-row" data-transaction-cash-field>
+              <label>
+                <span id="transaction-cash-label">出入金额</span>
+                <input id="transaction-cash-amount" type="number" min="0" step="0.01">
+              </label>
+            </div>
+
+            <div class="form-actions">
+              <button type="submit" class="primary-button">记录交易</button>
+            </div>
+          </form>
+
+          <div id="transaction-history" class="transaction-history"></div>
+        </section>
       </section>
 
       <section class="view-panel" data-view="platforms">

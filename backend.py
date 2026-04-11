@@ -65,6 +65,18 @@ def get_platform_currency(platform: str) -> str:
     return "USD" if str(platform or "").strip().lower() in {"ibkr", "schwab", "okx"} else "CNY"
 
 
+def resolve_fx_rate_to_cny(currency: str, fallback_rate: float = 0) -> float:
+    normalized = str(currency or "").strip().upper()
+    if normalized == "CNY" or not normalized:
+        return 1.0
+    if float(fallback_rate or 0) > 0:
+        return float(fallback_rate)
+    try:
+        return float(fetch_fx_rates([normalized], "CNY").get("rates", {}).get(normalized) or 1)
+    except Exception:
+        return 1.0
+
+
 def compute_asset_current_value(row: sqlite3.Row) -> float:
     value = float(row["quantity"] or 0) * float(row["current_price"] or 0) * float(row["fx_rate"] or 1)
     return -abs(value) if row["type"] == "liability" else value
@@ -165,6 +177,38 @@ def ensure_portfolio_snapshot_for_date(conn: sqlite3.Connection, user_id: int, s
             now_iso(),
         ),
     )
+
+
+def upsert_account_balance(
+    conn: sqlite3.Connection,
+    user_id: int,
+    platform: str,
+    free_cash: float,
+    display_currency: str,
+    updated_at: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO account_balances (user_id, platform, free_cash, display_currency, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, platform) DO UPDATE SET
+            free_cash = excluded.free_cash,
+            display_currency = excluded.display_currency,
+            updated_at = excluded.updated_at
+        """,
+        (user_id, platform, free_cash, display_currency, updated_at),
+    )
+
+
+def get_account_balance_entry(conn: sqlite3.Connection, user_id: int, platform: str) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT platform, free_cash, display_currency, updated_at
+        FROM account_balances
+        WHERE user_id = ? AND platform = ?
+        """,
+        (user_id, platform),
+    ).fetchone()
 
 
 def ensure_user_settings_columns(conn: sqlite3.Connection) -> None:
@@ -296,6 +340,29 @@ def init_db() -> None:
                 total_cash_balance REAL NOT NULL DEFAULT 0,
                 captured_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, snapshot_date),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS transactions (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                asset_name TEXT NOT NULL DEFAULT '',
+                asset_type TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                quantity REAL NOT NULL DEFAULT 0,
+                price REAL NOT NULL DEFAULT 0,
+                fee REAL NOT NULL DEFAULT 0,
+                cash_amount REAL NOT NULL DEFAULT 0,
+                currency TEXT NOT NULL DEFAULT '',
+                fx_rate REAL NOT NULL DEFAULT 1,
+                quote_source TEXT NOT NULL DEFAULT 'manual',
+                quote_date TEXT NOT NULL DEFAULT '',
+                realized_profit REAL NOT NULL DEFAULT 0,
+                notes TEXT NOT NULL DEFAULT '',
+                occurred_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             """
@@ -479,6 +546,25 @@ class BatchQuoteRefreshPayload(BaseModel):
     assets: list[AssetPayload]
 
 
+class TransactionPayload(BaseModel):
+    id: str
+    kind: str
+    platform: str
+    assetName: str = ""
+    assetType: str = ""
+    symbol: str = ""
+    quantity: float = 0
+    price: float = 0
+    fee: float = 0
+    cashAmount: float = 0
+    currency: str = ""
+    fxRate: float = 0
+    quoteSource: str = "manual"
+    quoteDate: str = ""
+    notes: str = ""
+    occurredAt: str
+
+
 app = FastAPI(title="WealthTrack API")
 app.add_middleware(
     CORSMiddleware,
@@ -550,6 +636,238 @@ def save_asset_record(conn: sqlite3.Connection, user_id: int, payload: AssetPayl
             payload.updatedAt,
         ),
     )
+
+
+def get_matching_asset_row(
+    conn: sqlite3.Connection,
+    user_id: int,
+    platform: str,
+    asset_type: str,
+    symbol: str,
+) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT id, name, platform, type, symbol, quantity, cost_price, current_price,
+               previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
+        FROM assets
+        WHERE user_id = ? AND platform = ? AND type = ? AND symbol = ?
+        LIMIT 1
+        """,
+        (user_id, platform, asset_type, symbol),
+    ).fetchone()
+
+
+def row_to_asset_payload(row: sqlite3.Row) -> AssetPayload:
+    return AssetPayload(
+        id=row["id"],
+        name=row["name"],
+        platform=row["platform"],
+        type=row["type"],
+        symbol=row["symbol"],
+        quantity=row["quantity"],
+        costPrice=row["cost_price"],
+        currentPrice=row["current_price"],
+        previousClose=row["previous_close"],
+        currency=row["currency"],
+        fxRate=row["fx_rate"],
+        quoteSource=row["quote_source"],
+        quoteDate=row["quote_date"],
+        quoteFetchedAt=row["quote_fetched_at"],
+        notes=row["notes"],
+        updatedAt=row["updated_at"],
+    )
+
+
+def list_transactions_for_user(conn: sqlite3.Connection, user_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, kind, platform, asset_name, asset_type, symbol, quantity, price, fee, cash_amount,
+               currency, fx_rate, quote_source, quote_date, realized_profit, notes, occurred_at, created_at
+        FROM transactions
+        WHERE user_id = ?
+        ORDER BY occurred_at DESC, created_at DESC
+        LIMIT 100
+        """,
+        (user_id,),
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "kind": row["kind"],
+            "platform": row["platform"],
+            "assetName": row["asset_name"],
+            "assetType": row["asset_type"],
+            "symbol": row["symbol"],
+            "quantity": row["quantity"],
+            "price": row["price"],
+            "fee": row["fee"],
+            "cashAmount": row["cash_amount"],
+            "currency": row["currency"],
+            "fxRate": row["fx_rate"],
+            "quoteSource": row["quote_source"],
+            "quoteDate": row["quote_date"],
+            "realizedProfit": row["realized_profit"],
+            "notes": row["notes"],
+            "occurredAt": row["occurred_at"],
+            "createdAt": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def apply_transaction(conn: sqlite3.Connection, user_id: int, payload: TransactionPayload) -> dict[str, Any]:
+    kind = str(payload.kind or "").strip().lower()
+    if kind not in {"buy", "sell", "deposit", "withdraw"}:
+        raise HTTPException(status_code=400, detail="不支持的交易类型")
+
+    platform = str(payload.platform or "").strip().lower()
+    if not platform:
+        raise HTTPException(status_code=400, detail="缺少平台")
+
+    currency = str(payload.currency or get_platform_currency(platform)).strip().upper() or get_platform_currency(platform)
+    fx_rate = resolve_fx_rate_to_cny(currency, payload.fxRate)
+    now_text = now_iso()
+    account_entry = get_account_balance_entry(conn, user_id, platform)
+    current_free_cash = float(account_entry["free_cash"] or 0) if account_entry else 0.0
+    display_currency = (
+        str(account_entry["display_currency"] or "").strip().upper()
+        if account_entry and str(account_entry["display_currency"] or "").strip()
+        else currency
+    )
+
+    quantity = float(payload.quantity or 0)
+    price = float(payload.price or 0)
+    fee = float(payload.fee or 0)
+    cash_amount = 0.0
+    realized_profit = 0.0
+
+    if kind in {"deposit", "withdraw"}:
+        raw_amount = float(payload.cashAmount or 0)
+        if raw_amount <= 0:
+            raise HTTPException(status_code=400, detail="入金或出金金额必须大于 0")
+        cash_amount = raw_amount if kind == "deposit" else -raw_amount
+        next_free_cash = current_free_cash + cash_amount
+        upsert_account_balance(conn, user_id, platform, next_free_cash, display_currency, payload.occurredAt)
+    else:
+        asset_type = str(payload.assetType or "").strip().lower()
+        symbol = str(payload.symbol or "").strip().upper()
+        asset_name = str(payload.assetName or "").strip()
+        if asset_type not in {"fund", "stock", "crypto", "cash", "liability"}:
+            raise HTTPException(status_code=400, detail="缺少有效资产类型")
+        if not symbol or quantity <= 0 or price <= 0:
+            raise HTTPException(status_code=400, detail="买卖交易需要填写代码、数量和价格")
+
+        matched_row = get_matching_asset_row(conn, user_id, platform, asset_type, symbol)
+        matched_asset = row_to_asset_payload(matched_row) if matched_row else None
+        gross_amount = quantity * price
+
+        if kind == "buy":
+            cash_amount = -(gross_amount + fee)
+            next_free_cash = current_free_cash + cash_amount
+            base_quantity = matched_asset.quantity if matched_asset else 0.0
+            base_cost_total = (matched_asset.quantity * matched_asset.costPrice) if matched_asset else 0.0
+            next_quantity = base_quantity + quantity
+            next_cost_price = (base_cost_total + gross_amount + fee) / next_quantity if next_quantity > 0 else price
+
+            next_asset = AssetPayload(
+                id=matched_asset.id if matched_asset else payload.id,
+                name=asset_name or (matched_asset.name if matched_asset else symbol),
+                platform=platform,
+                type=asset_type,
+                symbol=symbol,
+                quantity=next_quantity,
+                costPrice=next_cost_price,
+                currentPrice=price,
+                previousClose=matched_asset.previousClose if matched_asset else price,
+                currency=currency,
+                fxRate=fx_rate,
+                quoteSource=payload.quoteSource or (matched_asset.quoteSource if matched_asset else "manual"),
+                quoteDate=payload.quoteDate or (matched_asset.quoteDate if matched_asset else ""),
+                quoteFetchedAt=now_text,
+                notes=(matched_asset.notes if matched_asset else "") or payload.notes,
+                updatedAt=now_text,
+            )
+            save_asset_record(conn, user_id, next_asset)
+            upsert_account_balance(conn, user_id, platform, next_free_cash, display_currency, payload.occurredAt)
+        else:
+            if not matched_asset:
+                raise HTTPException(status_code=400, detail="未找到可卖出的持仓")
+            if quantity > matched_asset.quantity + 1e-9:
+                raise HTTPException(status_code=400, detail="卖出数量超过当前持仓")
+
+            cash_amount = gross_amount - fee
+            next_free_cash = current_free_cash + cash_amount
+            realized_profit = quantity * (price - matched_asset.costPrice) - fee
+            remaining_quantity = matched_asset.quantity - quantity
+
+            if remaining_quantity <= 1e-9:
+                conn.execute("DELETE FROM assets WHERE id = ? AND user_id = ?", (matched_asset.id, user_id))
+            else:
+                next_asset = matched_asset.model_copy(
+                    update={
+                        "quantity": remaining_quantity,
+                        "currentPrice": price,
+                        "fxRate": fx_rate,
+                        "quoteDate": payload.quoteDate or matched_asset.quoteDate,
+                        "quoteFetchedAt": now_text,
+                        "updatedAt": now_text,
+                    }
+                )
+                save_asset_record(conn, user_id, next_asset)
+            upsert_account_balance(conn, user_id, platform, next_free_cash, display_currency, payload.occurredAt)
+
+    conn.execute(
+        """
+        INSERT INTO transactions (
+            id, user_id, kind, platform, asset_name, asset_type, symbol, quantity, price, fee, cash_amount,
+            currency, fx_rate, quote_source, quote_date, realized_profit, notes, occurred_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.id,
+            user_id,
+            kind,
+            platform,
+            payload.assetName,
+            payload.assetType,
+            payload.symbol.strip().upper(),
+            quantity,
+            price,
+            fee,
+            cash_amount,
+            currency,
+            fx_rate,
+            payload.quoteSource,
+            payload.quoteDate,
+            realized_profit,
+            payload.notes,
+            payload.occurredAt,
+            now_text,
+        ),
+    )
+
+    return {
+        "transaction": {
+            "id": payload.id,
+            "kind": kind,
+            "platform": platform,
+            "assetName": payload.assetName,
+            "assetType": payload.assetType,
+            "symbol": payload.symbol.strip().upper(),
+            "quantity": quantity,
+            "price": price,
+            "fee": fee,
+            "cashAmount": cash_amount,
+            "currency": currency,
+            "fxRate": fx_rate,
+            "quoteSource": payload.quoteSource,
+            "quoteDate": payload.quoteDate,
+            "realizedProfit": realized_profit,
+            "notes": payload.notes,
+            "occurredAt": payload.occurredAt,
+            "createdAt": now_text,
+        }
+    }
 
 
 def is_admin_user(user: sqlite3.Row | dict[str, Any]) -> bool:
@@ -1401,6 +1719,14 @@ def list_account_balances(session_cookie: str | None = Cookie(default=None, alia
     }
 
 
+@app.get("/api/transactions")
+def list_transactions(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        transactions = list_transactions_for_user(conn, int(user["id"]))
+    return {"transactions": transactions}
+
+
 @app.get("/api/summary/weekly")
 def get_weekly_summary(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
     user = get_current_user(session_cookie)
@@ -1412,7 +1738,7 @@ def get_weekly_summary(session_cookie: str | None = Cookie(default=None, alias=S
         current_totals = compute_portfolio_totals(conn, int(user["id"]))
         baseline = conn.execute(
             """
-            SELECT snapshot_date, total_assets
+            SELECT snapshot_date, total_assets, captured_at
             FROM portfolio_snapshots
             WHERE user_id = ? AND snapshot_date >= ? AND snapshot_date <= ?
             ORDER BY snapshot_date ASC
@@ -1420,11 +1746,25 @@ def get_weekly_summary(session_cookie: str | None = Cookie(default=None, alias=S
             """,
             (int(user["id"]), week_start, today),
         ).fetchone()
+        net_external_flow = 0.0
+        if baseline:
+            external_flow_row = conn.execute(
+                """
+                SELECT COALESCE(SUM(cash_amount * fx_rate), 0) AS net_flow
+                FROM transactions
+                WHERE user_id = ?
+                  AND kind IN ('deposit', 'withdraw')
+                  AND occurred_at > ?
+                  AND occurred_at <= ?
+                """,
+                (int(user["id"]), baseline["captured_at"], now_iso()),
+            ).fetchone()
+            net_external_flow = float(external_flow_row["net_flow"] or 0) if external_flow_row else 0.0
         conn.commit()
 
     baseline_date = baseline["snapshot_date"] if baseline else today
     baseline_total_assets = float(baseline["total_assets"] or 0) if baseline else float(current_totals["totalAssets"])
-    weekly_profit = float(current_totals["totalAssets"]) - baseline_total_assets
+    weekly_profit = float(current_totals["totalAssets"]) - baseline_total_assets - net_external_flow
     base = abs(baseline_total_assets)
     weekly_profit_rate = (weekly_profit / base) * 100 if base > 0 else 0.0
 
@@ -1435,11 +1775,24 @@ def get_weekly_summary(session_cookie: str | None = Cookie(default=None, alias=S
             "baselineDate": baseline_date,
             "baselineTotalAssets": baseline_total_assets,
             "currentTotalAssets": float(current_totals["totalAssets"]),
+            "netExternalFlow": net_external_flow,
             "profit": weekly_profit,
             "profitRate": weekly_profit_rate,
             "isPartial": baseline_date != week_start,
         }
     }
+
+
+@app.post("/api/transactions")
+def create_transaction(
+    payload: TransactionPayload,
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        response = apply_transaction(conn, int(user["id"]), payload)
+        conn.commit()
+    return response
 
 
 @app.put("/api/account-balances")
