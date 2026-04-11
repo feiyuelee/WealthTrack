@@ -10,10 +10,11 @@ const state = {
   user: null,
   assets: [],
   accountBalances: [],
+  weeklySummary: createEmptyWeeklySummary(),
   settings: {
     finnhubKey: "",
     tushareToken: "",
-    autoRefreshInterval: 0,
+    autoRefreshInterval: 300,
     lastSyncAt: "",
     canEdit: false
   },
@@ -32,10 +33,23 @@ const state = {
   accountValuesVisible: false
 };
 
+function createEmptyWeeklySummary() {
+  return {
+    weekStartDate: "",
+    currentDate: "",
+    baselineDate: "",
+    baselineTotalAssets: 0,
+    currentTotalAssets: 0,
+    profit: 0,
+    profitRate: 0,
+    isPartial: false
+  };
+}
+
 init();
 
 async function init() {
-  mountCompactCurrencyControl();
+  mountGlobalToolbar();
   bindEvents();
   syncSettingsAccess();
   resetForm();
@@ -135,9 +149,301 @@ function mountCompactCurrencyControl() {
     });
   });
 
-  headline.replaceChildren(note, wrapper, statusGroup);
+  const controls = document.createElement("div");
+  controls.className = "hero-card__controls";
+  controls.append(wrapper);
+
+  const autoRefreshControl = document.createElement("label");
+  autoRefreshControl.className = "hero-quick-select";
+  autoRefreshControl.innerHTML = `
+    <select id="auto-refresh-compact" aria-label="自动刷新间隔">
+      <option value="60">1分钟</option>
+      <option value="180">3分钟</option>
+      <option value="300">5分钟</option>
+      <option value="600">10分钟</option>
+    </select>
+  `;
+  controls.append(autoRefreshControl);
+
+  headline.replaceChildren(note, controls, statusGroup);
   top.replaceChildren(headline);
 
+}
+
+function mountCompactCurrencyControl() {
+  const heroTop = document.querySelector(".hero-card .hero-card__top");
+  const heroMeta = document.querySelector(".hero-card .inline-meta");
+  const lastSyncLabel = document.querySelector("#last-sync-label");
+  const note = document.querySelector(".hero-card .hero-card__note");
+  const sidebarSelect = document.querySelector("#display-currency");
+  const toolbar = document.querySelector("#account-view-toolbar");
+
+  if (heroTop && heroMeta && lastSyncLabel && note && !document.querySelector("#auto-refresh-compact")) {
+    let headline = heroTop.querySelector(".hero-card__headline");
+    if (!headline) {
+      headline = document.createElement("div");
+      headline.className = "hero-card__headline";
+      heroTop.prepend(headline);
+    }
+
+    let statusGroup = heroTop.querySelector(".hero-card__status");
+    if (!statusGroup) {
+      statusGroup = document.createElement("div");
+      statusGroup.className = "hero-card__status";
+    }
+
+    let statusLabel = statusGroup.querySelector(".hero-card__status-label");
+    if (!statusLabel) {
+      statusLabel = document.createElement("span");
+      statusLabel.className = "hero-card__status-label";
+    }
+    statusLabel.textContent = "最近刷新";
+
+    const controls = document.createElement("div");
+    controls.className = "hero-card__controls";
+    const autoRefreshControl = document.createElement("label");
+    autoRefreshControl.className = "hero-quick-select";
+    autoRefreshControl.innerHTML = `
+      <select id="auto-refresh-compact" aria-label="自动刷新间隔">
+        <option value="60">1分钟</option>
+        <option value="180">3分钟</option>
+        <option value="300">5分钟</option>
+        <option value="600">10分钟</option>
+      </select>
+    `;
+    controls.append(autoRefreshControl);
+
+    statusGroup.replaceChildren(statusLabel, lastSyncLabel);
+    headline.replaceChildren(note, controls, statusGroup);
+    heroTop.replaceChildren(headline);
+  }
+
+  if (toolbar && sidebarSelect && !document.querySelector("#display-currency-compact-toggle")) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "currency-switch currency-switch--pill";
+    wrapper.innerHTML = `
+      <div id="display-currency-compact-toggle" class="currency-switch__segmented" role="group" aria-label="切换显示币种">
+        <button type="button" class="currency-switch__option" data-currency="CNY" aria-pressed="true" aria-label="切换为人民币显示">
+          <span class="currency-switch__icon" aria-hidden="true">¥</span>
+        </button>
+        <button type="button" class="currency-switch__option" data-currency="USD" aria-pressed="false" aria-label="切换为美元显示">
+          <span class="currency-switch__icon" aria-hidden="true">$</span>
+        </button>
+      </div>
+    `;
+    wrapper.querySelectorAll(".currency-switch__option").forEach((button) => {
+      button.addEventListener("click", () => {
+        const nextCurrency = button.dataset.currency;
+        if (!nextCurrency || nextCurrency === sidebarSelect.value) {
+          return;
+        }
+        sidebarSelect.value = nextCurrency;
+        sidebarSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      });
+    });
+    toolbar.append(wrapper);
+  }
+}
+
+function mountGlobalToolbar() {
+  const heroTop = document.querySelector(".hero-card .hero-card__top");
+  const lastSyncLabel = document.querySelector("#last-sync-label");
+  const note = document.querySelector(".hero-card .hero-card__note");
+
+  if (heroTop && lastSyncLabel && note && !document.querySelector("#auto-refresh-compact")) {
+    let headline = heroTop.querySelector(".hero-card__headline");
+    if (!headline) {
+      headline = document.createElement("div");
+      headline.className = "hero-card__headline";
+      heroTop.prepend(headline);
+    }
+
+    let statusGroup = heroTop.querySelector(".hero-card__status");
+    if (!statusGroup) {
+      statusGroup = document.createElement("div");
+      statusGroup.className = "hero-card__status";
+    }
+
+    let statusLabel = statusGroup.querySelector(".hero-card__status-label");
+    if (!statusLabel) {
+      statusLabel = document.createElement("span");
+      statusLabel.className = "hero-card__status-label";
+    }
+    statusLabel.textContent = "鏈€杩戝埛鏂?";
+
+    const controls = document.createElement("div");
+    controls.className = "hero-card__controls";
+    const autoRefreshControl = document.createElement("label");
+    autoRefreshControl.className = "hero-quick-select";
+    autoRefreshControl.innerHTML = `
+      <select id="auto-refresh-compact" aria-label="鑷姩鍒锋柊闂撮殧">
+        <option value="60">1鍒嗛挓</option>
+        <option value="180">3鍒嗛挓</option>
+        <option value="300">5鍒嗛挓</option>
+        <option value="600">10鍒嗛挓</option>
+      </select>
+    `;
+    controls.append(autoRefreshControl);
+    statusLabel.textContent = "最近刷新";
+    const refreshSelect = autoRefreshControl.querySelector("#auto-refresh-compact");
+    if (refreshSelect) {
+      refreshSelect.setAttribute("aria-label", "自动刷新间隔");
+      refreshSelect.innerHTML = `
+        <option value="60">1分钟</option>
+        <option value="180">3分钟</option>
+        <option value="300">5分钟</option>
+        <option value="600">10分钟</option>
+      `;
+    }
+
+    statusGroup.replaceChildren(statusLabel, lastSyncLabel);
+    headline.replaceChildren(note, controls, statusGroup);
+    heroTop.replaceChildren(headline);
+  }
+}
+
+function mountGlobalToolbar() {
+  const heroTop = document.querySelector(".hero-card .hero-card__top");
+  const lastSyncLabel = document.querySelector("#last-sync-label");
+  const note = document.querySelector(".hero-card .hero-card__note");
+  const sidebarRefresh = document.querySelector("#auto-refresh-sidebar");
+
+  if (!heroTop || !lastSyncLabel || !note) {
+    if (sidebarRefresh) {
+      sidebarRefresh.setAttribute("aria-label", "自动刷新间隔");
+      sidebarRefresh.innerHTML = `
+        <option value="60">1分钟</option>
+        <option value="180">3分钟</option>
+        <option value="300">5分钟</option>
+        <option value="600">10分钟</option>
+      `;
+    }
+    return;
+  }
+
+  if (sidebarRefresh) {
+    sidebarRefresh.setAttribute("aria-label", "自动刷新间隔");
+    sidebarRefresh.innerHTML = `
+      <option value="60">1m</option>
+      <option value="180">3m</option>
+      <option value="300">5m</option>
+      <option value="600">10m</option>
+    `;
+  }
+
+  let headline = heroTop.querySelector(".hero-card__headline");
+  if (!headline) {
+    headline = document.createElement("div");
+    headline.className = "hero-card__headline";
+    heroTop.prepend(headline);
+  }
+
+  let statusGroup = heroTop.querySelector(".hero-card__status");
+  if (!statusGroup) {
+    statusGroup = document.createElement("div");
+    statusGroup.className = "hero-card__status";
+  }
+
+  let statusLabel = statusGroup.querySelector(".hero-card__status-label");
+  if (!statusLabel) {
+    statusLabel = document.createElement("span");
+    statusLabel.className = "hero-card__status-label";
+  }
+
+  statusLabel.textContent = "最近刷新";
+  statusGroup.replaceChildren(statusLabel, lastSyncLabel);
+  headline.replaceChildren(note, statusGroup);
+  heroTop.replaceChildren(headline);
+}
+
+function mountGlobalToolbar() {
+  const heroTop = document.querySelector(".hero-card .hero-card__top");
+  const lastSyncLabel = document.querySelector("#last-sync-label");
+  const note = document.querySelector(".hero-card .hero-card__note");
+  const sidebarRefresh = document.querySelector("#auto-refresh-sidebar");
+
+  if (sidebarRefresh) {
+    sidebarRefresh.setAttribute("aria-label", "自动刷新间隔");
+    sidebarRefresh.innerHTML = `
+      <option value="60">1分钟</option>
+      <option value="180">3分钟</option>
+      <option value="300">5分钟</option>
+      <option value="600">10分钟</option>
+    `;
+  }
+
+  if (!heroTop || !lastSyncLabel || !note) {
+    return;
+  }
+
+  let headline = heroTop.querySelector(".hero-card__headline");
+  if (!headline) {
+    headline = document.createElement("div");
+    headline.className = "hero-card__headline";
+    heroTop.prepend(headline);
+  }
+
+  let statusGroup = heroTop.querySelector(".hero-card__status");
+  if (!statusGroup) {
+    statusGroup = document.createElement("div");
+    statusGroup.className = "hero-card__status";
+  }
+
+  let statusLabel = statusGroup.querySelector(".hero-card__status-label");
+  if (!statusLabel) {
+    statusLabel = document.createElement("span");
+    statusLabel.className = "hero-card__status-label";
+  }
+
+  statusLabel.textContent = "最近刷新";
+  statusGroup.replaceChildren(statusLabel, lastSyncLabel);
+  headline.replaceChildren(note, statusGroup);
+  heroTop.replaceChildren(headline);
+}
+
+function mountGlobalToolbar() {
+  const heroTop = document.querySelector(".hero-card .hero-card__top");
+  const lastSyncLabel = document.querySelector("#last-sync-label");
+  const note = document.querySelector(".hero-card .hero-card__note");
+  const sidebarRefresh = document.querySelector("#auto-refresh-sidebar");
+
+  if (sidebarRefresh) {
+    sidebarRefresh.setAttribute("aria-label", "自动刷新间隔");
+    sidebarRefresh.innerHTML = `
+      <option value="60">1m</option>
+      <option value="180">3m</option>
+      <option value="300">5m</option>
+      <option value="600">10m</option>
+    `;
+  }
+
+  if (!heroTop || !lastSyncLabel || !note) {
+    return;
+  }
+
+  let headline = heroTop.querySelector(".hero-card__headline");
+  if (!headline) {
+    headline = document.createElement("div");
+    headline.className = "hero-card__headline";
+    heroTop.prepend(headline);
+  }
+
+  let statusGroup = heroTop.querySelector(".hero-card__status");
+  if (!statusGroup) {
+    statusGroup = document.createElement("div");
+    statusGroup.className = "hero-card__status";
+  }
+
+  let statusLabel = statusGroup.querySelector(".hero-card__status-label");
+  if (!statusLabel) {
+    statusLabel = document.createElement("span");
+    statusLabel.className = "hero-card__status-label";
+  }
+
+  statusLabel.textContent = "最近刷新";
+  statusGroup.replaceChildren(statusLabel, lastSyncLabel);
+  headline.replaceChildren(note, statusGroup);
+  heroTop.replaceChildren(headline);
 }
 
 function bindEvents() {
@@ -150,7 +456,10 @@ function bindEvents() {
     document.querySelector("#import-assets-file").click();
   });
   document.querySelector("#import-assets-file").addEventListener("change", handleImportAssets);
-  document.querySelector("#save-settings-button").addEventListener("click", saveSettings);
+  const saveSettingsButton = document.querySelector("#save-settings-button");
+  if (saveSettingsButton) {
+    saveSettingsButton.addEventListener("click", saveSettings);
+  }
   document.querySelector("#refresh-provider-status-button").addEventListener("click", () => {
     refreshProviderStatuses({ force: true });
   });
@@ -168,13 +477,36 @@ function bindEvents() {
   document.querySelector("#asset-symbol").addEventListener("input", validateAssetSymbolCompatibility);
   document.querySelector("#asset-symbol").addEventListener("blur", autoFillLatestPrice);
   document.querySelector("#display-currency").addEventListener("change", handleDisplayCurrencyChange);
-  const accountOverviewCurrency = document.querySelector("#account-overview-currency");
-  if (accountOverviewCurrency) {
-    accountOverviewCurrency.addEventListener("change", handleAccountOverviewCurrencyChange);
-  }
   const accountPrivacyToggle = document.querySelector("#account-privacy-toggle");
   if (accountPrivacyToggle) {
     accountPrivacyToggle.addEventListener("click", toggleAccountValuesVisibility);
+  }
+  const compactCurrencyToggle = document.querySelector("#display-currency-compact-toggle");
+  if (compactCurrencyToggle) {
+    compactCurrencyToggle.addEventListener("click", () => {
+      const currencySelect = document.querySelector("#display-currency");
+      if (!currencySelect) {
+        return;
+      }
+      currencySelect.value = currencySelect.value === "USD" ? "CNY" : "USD";
+      currencySelect.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+  }
+  const autoRefreshCycle = document.querySelector("#auto-refresh-cycle");
+  if (autoRefreshCycle) {
+    autoRefreshCycle.addEventListener("click", cycleAutoRefreshInterval);
+  }
+  const autoRefreshCyclePrimary = document.querySelector("#auto-refresh-cycle-primary");
+  if (autoRefreshCyclePrimary) {
+    autoRefreshCyclePrimary.addEventListener("click", cycleAutoRefreshInterval);
+  }
+  const autoRefreshSidebar = document.querySelector("#auto-refresh-sidebar");
+  if (autoRefreshSidebar) {
+    autoRefreshSidebar.addEventListener("change", handleAutoRefreshIntervalChange);
+  }
+  const autoRefreshCompact = document.querySelector("#auto-refresh-compact");
+  if (autoRefreshCompact) {
+    autoRefreshCompact.addEventListener("change", handleAutoRefreshIntervalChange);
   }
   document.querySelector("#asset-type-filter").addEventListener("change", handleFilterChange);
   document.querySelector("#clear-filter-btn").addEventListener("click", clearFilters);
@@ -214,11 +546,13 @@ async function loadServerData() {
   state.assets = assetsResponse.assets;
   state.settings = settingsResponse.settings;
   state.accountBalances = accountBalancesResponse.accountBalances || [];
+  state.weeklySummary = createEmptyWeeklySummary();
   state.accountOverviewCurrency = inferAccountOverviewCurrency();
   hydrateSettings();
   updateAuthUI();
   unlockAppForUser();
   render();
+  await refreshWeeklySummary({ renderAfter: true });
   await refreshProviderStatuses({ silent: true });
   setupAutoRefresh();
 
@@ -248,6 +582,7 @@ function render() {
   renderAccountPrivacyToggle();
   renderDisplayCurrencyBadges();
   renderSummary(filteredAssets);
+  renderWeeklySummary();
   renderHomepageAssetDistribution(filteredAssets);
   renderHomepagePlatformProfit(filteredAssets);
   renderPlatformSummary(filteredAssets);
@@ -261,19 +596,11 @@ function renderDisplayCurrencyBadges() {
   const compactToggle = document.querySelector("#display-currency-compact-toggle");
   if (compactToggle) {
     compactToggle.dataset.currency = label;
-    compactToggle.setAttribute("aria-label", label === "USD" ? "切换为人民币显示" : "切换为美元显示");
-    const icon = compactToggle.querySelector(".currency-switch__icon");
-    const text = compactToggle.querySelector(".currency-switch__label");
-    if (icon) {
-      icon.textContent = label === "USD" ? "$" : "¥";
-    }
-    if (text) {
-      text.textContent = label;
-    }
-  }
-  const accountOverviewCurrency = document.querySelector("#account-overview-currency");
-  if (accountOverviewCurrency && accountOverviewCurrency.value !== state.accountOverviewCurrency) {
-    accountOverviewCurrency.value = state.accountOverviewCurrency;
+    compactToggle.setAttribute("aria-label", label === "USD" ? "当前美元，点击切换为人民币显示" : "当前人民币，点击切换为美元显示");
+    compactToggle.title = label === "USD" ? "当前 USD，点击切换到 CNY" : "当前 CNY，点击切换到 USD";
+    compactToggle.innerHTML = `
+      <span class="sidebar-tool-button__icon" aria-hidden="true">${label === "USD" ? "$" : "¥"}</span>
+    `;
   }
 }
 
@@ -311,7 +638,6 @@ function renderSummary(assets) {
   summary.totalAssets += accountFreeCashCny;
 
   const base = Math.abs(summary.totalCost);
-  const profitRate = base > 0 ? (summary.totalProfit / base) * 100 : 0;
   const dailyProfitRate = base > 0 ? (summary.dailyProfit / base) * 100 : 0;
 
   setText("#total-assets", getMaskedSensitiveText(formatCurrency(summary.totalAssets)));
@@ -320,15 +646,55 @@ function renderSummary(assets) {
   setText("#total-cash-balance", getMaskedSensitiveText(formatCurrency(totalCashBalance)));
   setText("#hero-daily-profit-main", formatCurrency(summary.dailyProfit));
   setText("#hero-daily-profit-rate", `${formatSignedNumber(dailyProfitRate)}%`);
-  setText("#hero-total-profit-rate", `${formatSignedNumber(profitRate)}%`);
 
   applyNumberTone(document.querySelector("#daily-profit"), summary.dailyProfit);
   applyNumberTone(document.querySelector("#total-margin"), -totalMargin);
   applyNumberTone(document.querySelector("#total-cash-balance"), totalCashBalance);
   applyNumberTone(document.querySelector("#hero-daily-profit-main"), summary.dailyProfit);
   applyNumberTone(document.querySelector("#hero-daily-profit-rate"), dailyProfitRate);
-  applyNumberTone(document.querySelector("#hero-total-profit-rate"), profitRate);
   updateLastSyncLabel(state.settings.lastSyncAt);
+}
+
+function renderWeeklySummary() {
+  const summary = {
+    ...createEmptyWeeklySummary(),
+    ...(state.weeklySummary || {})
+  };
+  const note = summary.isPartial && summary.baselineDate
+    ? `本周从 ${summary.baselineDate} 开始 · ${formatSignedNumber(summary.profitRate)}%`
+    : `${summary.weekStartDate || "周一"} 至今 · ${formatSignedNumber(summary.profitRate)}%`;
+
+  setText("#weekly-profit", getMaskedSensitiveText(formatCurrency(summary.profit)));
+  setText("#weekly-profit-note", note);
+  setText("#hero-total-profit-rate", `${formatSignedNumber(summary.profitRate)}%`);
+  applyNumberTone(document.querySelector("#weekly-profit"), summary.profit);
+  applyNumberTone(document.querySelector("#hero-total-profit-rate"), summary.profitRate);
+}
+
+async function refreshWeeklySummary(options = {}) {
+  const { renderAfter = true } = options;
+  if (!state.user) {
+    state.weeklySummary = createEmptyWeeklySummary();
+    if (renderAfter) {
+      renderWeeklySummary();
+    }
+    return;
+  }
+
+  try {
+    const response = await apiFetch("/api/summary/weekly");
+    state.weeklySummary = {
+      ...createEmptyWeeklySummary(),
+      ...(response.summary || {})
+    };
+  } catch (error) {
+    console.error("Failed to refresh weekly summary", error);
+    state.weeklySummary = createEmptyWeeklySummary();
+  }
+
+  if (renderAfter) {
+    renderWeeklySummary();
+  }
 }
 
 function renderPlatformSummary(assets) {
@@ -525,6 +891,7 @@ async function handleSubmit(event) {
     showToast("资产已保存");
   }
 
+  await refreshWeeklySummary({ renderAfter: false });
   resetForm();
   render();
 }
@@ -573,6 +940,7 @@ async function logout() {
   state.user = null;
   state.assets = [];
   state.accountBalances = [];
+  state.weeklySummary = createEmptyWeeklySummary();
   state.accountOverviewCurrency = "CNY";
     state.settings = {
       finnhubKey: "",
@@ -610,6 +978,7 @@ async function handleAssetAction(event) {
 
   await apiFetch(`/api/assets/${encodeURIComponent(asset.id)}`, { method: "DELETE" });
   state.assets = state.assets.filter((item) => item.id !== id);
+  await refreshWeeklySummary({ renderAfter: false });
   render();
   showToast(`已删除 ${asset.name}`);
 }
@@ -630,6 +999,7 @@ async function clearAssets() {
     await apiFetch(`/api/assets/${encodeURIComponent(asset.id)}`, { method: "DELETE" });
   }
   state.assets = [];
+  await refreshWeeklySummary({ renderAfter: false });
   render();
   showToast("全部资产已清空");
 }
@@ -785,7 +1155,6 @@ async function saveSettings() {
 
   state.settings.finnhubKey = document.querySelector("#alpha-vantage-key").value.trim();
   state.settings.tushareToken = document.querySelector("#tushare-token").value.trim();
-  state.settings.autoRefreshInterval = Number(document.querySelector("#auto-refresh-interval").value);
 
   await apiFetch("/api/settings", {
     method: "PUT",
@@ -795,6 +1164,25 @@ async function saveSettings() {
   await refreshProviderStatuses({ silent: true });
   setupAutoRefresh();
   showToast("设置已保存");
+}
+
+function handleAutoRefreshIntervalChange(event) {
+  const nextInterval = Number(event.target.value) || 300;
+  state.settings.autoRefreshInterval = nextInterval;
+  setupAutoRefresh();
+  syncAutoRefreshControl();
+  showToast(`自动刷新已切换为 ${getAutoRefreshLabel(nextInterval)}`);
+}
+
+function cycleAutoRefreshInterval() {
+  const intervals = [60, 180, 300, 600];
+  const current = Number(state.settings.autoRefreshInterval) || 300;
+  const currentIndex = intervals.indexOf(current);
+  const nextInterval = intervals[(currentIndex + 1 + intervals.length) % intervals.length];
+  state.settings.autoRefreshInterval = nextInterval;
+  setupAutoRefresh();
+  syncAutoRefreshControl();
+  showToast(`自动刷新已切换为 ${getAutoRefreshLabel(nextInterval)}`);
 }
 
 async function refreshAllPrices(options = {}) {
@@ -837,6 +1225,7 @@ async function refreshAllPrices(options = {}) {
     failureCount = state.assets.length;
   }
 
+  await refreshWeeklySummary({ renderAfter: false });
   updateLastSyncLabel(state.settings.lastSyncAt);
   render();
 
@@ -1314,8 +1703,9 @@ function formatUnitPrice(value, source, currency) {
 function hydrateSettings() {
   document.querySelector("#alpha-vantage-key").value = state.settings.finnhubKey || "";
   document.querySelector("#tushare-token").value = state.settings.tushareToken || "";
-  document.querySelector("#auto-refresh-interval").value = String(state.settings.autoRefreshInterval || 0);
+  state.settings.autoRefreshInterval = 300;
   document.querySelector("#display-currency").value = state.displayCurrency;
+  syncAutoRefreshControl();
   updateLastSyncLabel();
   renderProviderStatusLoading();
   syncSettingsAccess();
@@ -1323,7 +1713,7 @@ function hydrateSettings() {
 
 function syncSettingsAccess() {
   const canEdit = !!state.settings.canEdit;
-  ["#alpha-vantage-key", "#tushare-token", "#auto-refresh-interval", "#save-settings-button"].forEach((selector) => {
+  ["#alpha-vantage-key", "#tushare-token", "#save-settings-button"].forEach((selector) => {
     const element = document.querySelector(selector);
     if (element) {
       element.disabled = !canEdit;
@@ -1348,6 +1738,41 @@ function syncSettingsAccess() {
       ? "当前为管理员账号，可以编辑行情配置。"
       : "当前为普通账号，非 admin 账户不能修改行情配置，只能查看。";
   }
+}
+
+function syncAutoRefreshControl() {
+  const autoRefreshCompact = document.querySelector("#auto-refresh-compact");
+  if (autoRefreshCompact) {
+    autoRefreshCompact.value = String(state.settings.autoRefreshInterval || 300);
+  }
+  const autoRefreshSidebar = document.querySelector("#auto-refresh-sidebar");
+  if (autoRefreshSidebar) {
+    autoRefreshSidebar.value = String(state.settings.autoRefreshInterval || 300);
+  }
+  const autoRefreshCycle = document.querySelector("#auto-refresh-cycle");
+  if (autoRefreshCycle) {
+    const label = getAutoRefreshLabel(state.settings.autoRefreshInterval || 300);
+    autoRefreshCycle.textContent = label;
+    autoRefreshCycle.setAttribute("aria-label", `自动刷新间隔，当前 ${label}，点击切换`);
+    autoRefreshCycle.title = `自动刷新间隔：${label}`;
+  }
+  const autoRefreshCyclePrimary = document.querySelector("#auto-refresh-cycle-primary");
+  if (autoRefreshCyclePrimary) {
+    const label = getAutoRefreshLabel(state.settings.autoRefreshInterval || 300);
+    autoRefreshCyclePrimary.textContent = label;
+    autoRefreshCyclePrimary.setAttribute("aria-label", `自动刷新间隔，当前 ${label}，点击切换`);
+    autoRefreshCyclePrimary.title = `自动刷新间隔：${label}`;
+  }
+}
+
+function getAutoRefreshLabel(intervalSeconds) {
+  const intervalMap = {
+    60: "1分钟",
+    180: "3分钟",
+    300: "5分钟",
+    600: "10分钟"
+  };
+  return intervalMap[intervalSeconds] || "5分钟";
 }
 
 function setupAutoRefresh() {
@@ -2089,9 +2514,18 @@ renderDisplayCurrencyBadges = function renderDisplayCurrencyBadgesSegmented() {
       button.setAttribute("aria-pressed", isActive ? "true" : "false");
     });
   }
-  const accountOverviewCurrency = document.querySelector("#account-overview-currency");
-  if (accountOverviewCurrency && accountOverviewCurrency.value !== state.accountOverviewCurrency) {
-    accountOverviewCurrency.value = state.accountOverviewCurrency;
+};
+
+renderDisplayCurrencyBadges = function renderDisplayCurrencyBadgesFloatingTool() {
+  const label = state.displayCurrency || "CNY";
+  const compactToggle = document.querySelector("#display-currency-compact-toggle");
+  if (compactToggle) {
+    compactToggle.dataset.currency = label;
+    compactToggle.setAttribute("aria-label", label === "USD" ? "当前美元，点击切换为人民币显示" : "当前人民币，点击切换为美元显示");
+    compactToggle.title = label === "USD" ? "当前 USD，点击切换到 CNY" : "当前 CNY，点击切换到 USD";
+    compactToggle.innerHTML = `
+      <span class="sidebar-tool-button__icon" aria-hidden="true">${label === "USD" ? "$" : "¥"}</span>
+    `;
   }
 };
 
@@ -2822,6 +3256,7 @@ async function handleAccountBalanceSave(event) {
   } else {
     state.accountBalances.push(nextItem);
   }
+  await refreshWeeklySummary({ renderAfter: false });
   render();
   showToast(`${getPlatformLabel(platform)} 自由资金已保存`);
 }
@@ -2859,6 +3294,7 @@ async function handleAccountDisplayCurrencyChange(event) {
   } else {
     state.accountBalances.push(nextItem);
   }
+  await refreshWeeklySummary({ renderAfter: false });
   render();
 }
 
@@ -2896,7 +3332,7 @@ function renderPlatformSummary(assets) {
         const freeCashLabel = group.freeCashCny >= 0 ? "账户余额" : "融资占用";
         const freeCashValue = Math.abs(group.freeCashCny);
         const unitLabel = getPlatformCurrency(group.platform);
-        const displayUnit = state.accountOverviewCurrency || inferAccountOverviewCurrency();
+        const displayUnit = state.displayCurrency || "CNY";
         const netValueText = getMaskedSensitiveText(formatCurrencyByUnit(group.netValue, displayUnit));
         const holdingsValueText = getMaskedSensitiveText(formatCurrencyByUnit(group.holdingsValue, displayUnit));
         const totalProfitText = getMaskedSensitiveText(formatCurrencyByUnit(group.totalProfit, displayUnit));

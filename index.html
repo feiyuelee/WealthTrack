@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=Noto+Sans+SC:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="./styles.css?v=20260408-8">
+  <link rel="stylesheet" href="./styles.css?v=20260408-10">
 </head>
 <body>
   <div class="app-shell">
@@ -51,6 +51,21 @@
         <button class="menu-button" data-view-target="account">账户中心</button>
       </nav>
 
+      <div class="sidebar-floating-tools" aria-label="鍏ㄥ眬鏄剧ず璁剧疆">
+        <button id="auto-refresh-cycle-primary" class="ghost-button sidebar-refresh-cycle" type="button" aria-label="自动刷新间隔"></button>
+        <button id="account-privacy-toggle" class="ghost-button sidebar-tool-button privacy-toggle" type="button" aria-pressed="false" aria-label="Show account overview data"></button>
+        <button id="display-currency-compact-toggle" class="ghost-button sidebar-tool-button sidebar-tool-button--currency" type="button" aria-label="鍒囨崲鏄剧ず甯佺"></button>
+        <label class="sidebar-refresh-select" for="auto-refresh-sidebar">
+          <select id="auto-refresh-sidebar" aria-label="自动刷新间隔">
+            <option value="60">1m</option>
+            <option value="180">3m</option>
+            <option value="300">5m</option>
+            <option value="600">10m</option>
+          </select>
+        </label>
+        <button id="auto-refresh-cycle" class="ghost-button sidebar-refresh-cycle" type="button" aria-label="自动刷新间隔"></button>
+      </div>
+
       <section class="panel">
         <div class="panel-header panel-header--compact">
           <div>
@@ -90,7 +105,6 @@
               <div class="distribution-card__head">
                 <span>资产分布</span>
                 <div class="distribution-card__actions">
-                  <button id="account-privacy-toggle" type="button" class="ghost-button privacy-toggle" aria-pressed="false" aria-label="Show account overview data"></button>
                   <small id="asset-distribution-total">暂无数据</small>
                 </div>
               </div>
@@ -104,7 +118,6 @@
             <div class="hero-card__top">
               <span>最近刷新</span>
               <div class="inline-meta">
-                <span id="display-currency-badge" class="display-currency-badge">CNY</span>
                 <span id="last-sync-label">未刷新</span>
               </div>
             </div>
@@ -116,7 +129,7 @@
                 <strong id="hero-daily-profit-rate">0.00%</strong>
               </div>
               <div>
-                <span>累计收益率</span>
+                <span>本周收益率</span>
                 <strong id="hero-total-profit-rate">0.00%</strong>
               </div>
             </div>
@@ -145,6 +158,11 @@
               <span>今日收益</span>
               <strong id="daily-profit">¥0.00</strong>
               <small>基于昨收或昨日净值估算</small>
+            </article>
+            <article class="stat-card">
+              <span>本周收益</span>
+              <strong id="weekly-profit">¥0.00</strong>
+              <small id="weekly-profit-note">周一至今 · +0.00%</small>
             </article>
             <article class="stat-card">
               <span>融资金额</span>
@@ -279,25 +297,15 @@
         </section>
       </section>
 
-        <section class="view-panel" data-view="platforms">
-          <section class="panel">
-            <div class="panel-header">
-              <div>
-                <p class="section-tag">账户</p>
-                <h2>账户总览</h2>
-              </div>
-              <select id="account-overview-currency" class="account-overview-currency-select">
-                <option value="CNY">CNY</option>
-                <option value="USD">USD</option>
-              </select>
-            </div>
-              <div id="platform-summary-grid" class="stats-grid">
-                <article class="stat-card">
-                  <span>暂无账户数据</span>
-                <strong>¥0.00</strong>
-                <small>录入资产后会自动汇总</small>
-              </article>
-            </div>
+      <section class="view-panel" data-view="platforms">
+        <section class="panel">
+          <div id="platform-summary-grid" class="stats-grid">
+            <article class="stat-card">
+              <span>暂无账户数据</span>
+              <strong>¥0.00</strong>
+              <small>录入资产后会自动汇总</small>
+            </article>
+          </div>
         </section>
       </section>
 
@@ -422,17 +430,6 @@
               </label>
             </div>
           </div>
-          <div class="settings-grid single-row-settings">
-            <label>
-              <span>自动刷新间隔</span>
-              <select id="auto-refresh-interval">
-                <option value="0">关闭自动刷新</option>
-                <option value="60">每 1 分钟</option>
-                <option value="300">每 5 分钟</option>
-                <option value="900">每 15 分钟</option>
-              </select>
-            </label>
-          </div>
           <div class="form-actions">
             <button id="save-settings-button" type="button" class="primary-button">保存设置</button>
           </div>
@@ -481,6 +478,6 @@
 
   <div id="toast" class="toast" aria-live="polite"></div>
 
-    <script src="./app.js?v=20260408-18"></script>
+    <script src="./app.js?v=20260408-21"></script>
 </body>
 </html>

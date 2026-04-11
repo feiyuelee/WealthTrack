@@ -52,6 +52,121 @@ def get_db() -> sqlite3.Connection:
     return connection
 
 
+def get_today_beijing_date() -> str:
+    return datetime.now(BEIJING_TZ).date().isoformat()
+
+
+def get_week_start_date(date_text: str) -> str:
+    current_date = datetime.strptime(date_text, "%Y-%m-%d").date()
+    return (current_date - timedelta(days=current_date.weekday())).isoformat()
+
+
+def get_platform_currency(platform: str) -> str:
+    return "USD" if str(platform or "").strip().lower() in {"ibkr", "schwab", "okx"} else "CNY"
+
+
+def compute_asset_current_value(row: sqlite3.Row) -> float:
+    value = float(row["quantity"] or 0) * float(row["current_price"] or 0) * float(row["fx_rate"] or 1)
+    return -abs(value) if row["type"] == "liability" else value
+
+
+def compute_asset_cost_value(row: sqlite3.Row) -> float:
+    value = float(row["quantity"] or 0) * float(row["cost_price"] or 0) * float(row["fx_rate"] or 1)
+    return -abs(value) if row["type"] == "liability" else value
+
+
+def compute_portfolio_totals(conn: sqlite3.Connection, user_id: int) -> dict[str, float]:
+    asset_rows = conn.execute(
+        """
+        SELECT type, platform, quantity, cost_price, current_price, currency, fx_rate
+        FROM assets
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchall()
+    balance_rows = conn.execute(
+        """
+        SELECT platform, free_cash
+        FROM account_balances
+        WHERE user_id = ?
+        """,
+        (user_id,),
+    ).fetchall()
+
+    fx_currencies = sorted(
+        {
+            get_platform_currency(str(row["platform"]))
+            for row in balance_rows
+            if get_platform_currency(str(row["platform"])) != "CNY"
+        }
+    )
+    balance_fx_rates: dict[str, Any] = {}
+    if fx_currencies:
+        try:
+            balance_fx_rates = fetch_fx_rates(fx_currencies, "CNY").get("rates", {})
+        except Exception:
+            balance_fx_rates = {}
+
+    total_assets = 0.0
+    total_cost = 0.0
+    total_profit = 0.0
+    total_margin = 0.0
+    total_cash_balance = 0.0
+
+    for row in asset_rows:
+        current_value = compute_asset_current_value(row)
+        cost_value = compute_asset_cost_value(row)
+        total_assets += current_value
+        total_cost += cost_value
+        total_profit += current_value - cost_value
+
+    for row in balance_rows:
+        currency = get_platform_currency(str(row["platform"]))
+        fx_rate = 1.0 if currency == "CNY" else float(balance_fx_rates.get(currency) or 1)
+        free_cash_cny = float(row["free_cash"] or 0) * fx_rate
+        total_assets += free_cash_cny
+        if free_cash_cny < 0:
+            total_margin += abs(free_cash_cny)
+        else:
+            total_cash_balance += free_cash_cny
+
+    return {
+        "totalAssets": total_assets,
+        "totalCost": total_cost,
+        "totalProfit": total_profit,
+        "totalMargin": total_margin,
+        "totalCashBalance": total_cash_balance,
+    }
+
+
+def ensure_portfolio_snapshot_for_date(conn: sqlite3.Connection, user_id: int, snapshot_date: str) -> None:
+    existing = conn.execute(
+        "SELECT 1 FROM portfolio_snapshots WHERE user_id = ? AND snapshot_date = ?",
+        (user_id, snapshot_date),
+    ).fetchone()
+    if existing:
+        return
+
+    totals = compute_portfolio_totals(conn, user_id)
+    conn.execute(
+        """
+        INSERT INTO portfolio_snapshots (
+            user_id, snapshot_date, total_assets, total_cost, total_profit, total_margin, total_cash_balance, captured_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            user_id,
+            snapshot_date,
+            totals["totalAssets"],
+            totals["totalCost"],
+            totals["totalProfit"],
+            totals["totalMargin"],
+            totals["totalCashBalance"],
+            now_iso(),
+        ),
+    )
+
+
 def ensure_user_settings_columns(conn: sqlite3.Connection) -> None:
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(user_settings)").fetchall()}
     if "tushare_token" not in columns:
@@ -168,6 +283,19 @@ def init_db() -> None:
                 display_currency TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (user_id, platform),
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS portfolio_snapshots (
+                user_id INTEGER NOT NULL,
+                snapshot_date TEXT NOT NULL,
+                total_assets REAL NOT NULL DEFAULT 0,
+                total_cost REAL NOT NULL DEFAULT 0,
+                total_profit REAL NOT NULL DEFAULT 0,
+                total_margin REAL NOT NULL DEFAULT 0,
+                total_cash_balance REAL NOT NULL DEFAULT 0,
+                captured_at TEXT NOT NULL,
+                PRIMARY KEY (user_id, snapshot_date),
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
             """
@@ -1270,6 +1398,47 @@ def list_account_balances(session_cookie: str | None = Cookie(default=None, alia
             }
             for row in rows
         ]
+    }
+
+
+@app.get("/api/summary/weekly")
+def get_weekly_summary(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    today = get_today_beijing_date()
+    week_start = get_week_start_date(today)
+
+    with closing(get_db()) as conn:
+        ensure_portfolio_snapshot_for_date(conn, int(user["id"]), today)
+        current_totals = compute_portfolio_totals(conn, int(user["id"]))
+        baseline = conn.execute(
+            """
+            SELECT snapshot_date, total_assets
+            FROM portfolio_snapshots
+            WHERE user_id = ? AND snapshot_date >= ? AND snapshot_date <= ?
+            ORDER BY snapshot_date ASC
+            LIMIT 1
+            """,
+            (int(user["id"]), week_start, today),
+        ).fetchone()
+        conn.commit()
+
+    baseline_date = baseline["snapshot_date"] if baseline else today
+    baseline_total_assets = float(baseline["total_assets"] or 0) if baseline else float(current_totals["totalAssets"])
+    weekly_profit = float(current_totals["totalAssets"]) - baseline_total_assets
+    base = abs(baseline_total_assets)
+    weekly_profit_rate = (weekly_profit / base) * 100 if base > 0 else 0.0
+
+    return {
+        "summary": {
+            "weekStartDate": week_start,
+            "currentDate": today,
+            "baselineDate": baseline_date,
+            "baselineTotalAssets": baseline_total_assets,
+            "currentTotalAssets": float(current_totals["totalAssets"]),
+            "profit": weekly_profit,
+            "profitRate": weekly_profit_rate,
+            "isPartial": baseline_date != week_start,
+        }
     }
 
 
