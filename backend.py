@@ -47,8 +47,11 @@ def now_iso() -> str:
 
 def get_db() -> sqlite3.Connection:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DB_PATH)
+    connection = sqlite3.connect(DB_PATH, timeout=30)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
+    connection.execute("PRAGMA busy_timeout = 30000")
     return connection
 
 
@@ -700,6 +703,45 @@ def row_to_asset_payload(row: sqlite3.Row) -> AssetPayload:
     )
 
 
+def update_asset_quote_fields(conn: sqlite3.Connection, user_id: int, payload: AssetPayload) -> AssetPayload | None:
+    conn.execute(
+        """
+        UPDATE assets
+        SET current_price = ?,
+            previous_close = ?,
+            currency = ?,
+            fx_rate = ?,
+            quote_source = ?,
+            quote_date = ?,
+            quote_fetched_at = ?,
+            updated_at = ?
+        WHERE id = ? AND user_id = ?
+        """,
+        (
+            payload.currentPrice,
+            payload.previousClose,
+            payload.currency,
+            payload.fxRate,
+            payload.quoteSource,
+            payload.quoteDate,
+            payload.quoteFetchedAt,
+            payload.updatedAt,
+            payload.id,
+            user_id,
+        ),
+    )
+    row = conn.execute(
+        """
+        SELECT id, name, platform, type, symbol, quantity, cost_price, current_price,
+               previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
+        FROM assets
+        WHERE id = ? AND user_id = ?
+        """,
+        (payload.id, user_id),
+    ).fetchone()
+    return row_to_asset_payload(row) if row else None
+
+
 def row_to_transaction_payload(row: sqlite3.Row) -> TransactionPayload:
     return TransactionPayload(
         id=row["id"],
@@ -1106,7 +1148,15 @@ def rebuild_portfolio_from_records(conn: sqlite3.Connection, user_id: int) -> No
             )
             continue
 
-        result = apply_transaction_effect(conn, user_id, payload)
+        try:
+            result = apply_transaction_effect(conn, user_id, payload)
+        except HTTPException as exc:
+            detail = str(exc.detail or "")
+            # Legacy trade rows may exist without a reconstructable opening position.
+            # Skip those orphan records so they do not block new writes.
+            if detail in {"未找到可卖出的持仓", "卖出数量超过当前持仓"}:
+                continue
+            raise
         transaction = result["transaction"]
         conn.execute(
             """
@@ -2309,10 +2359,11 @@ def quote_refresh_batch(
         for asset, ok in results:
             if ok:
                 success_count += 1
-                save_asset_record(conn, user["id"], asset)
+                persisted_asset = update_asset_quote_fields(conn, int(user["id"]), asset)
+                refreshed_assets.append((persisted_asset or asset).model_dump())
             else:
                 failure_count += 1
-            refreshed_assets.append(asset.model_dump())
+                refreshed_assets.append(asset.model_dump())
         conn.commit()
 
     return {

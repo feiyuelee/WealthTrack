@@ -337,7 +337,7 @@
               </div>
               <div class="transaction-form__stack" data-transaction-asset-field>
                 <label>
-                  <span>成交价</span>
+                  <span>成交单价</span>
                   <input id="transaction-price" type="number" min="0" step="0.000001">
                 </label>
                 <label>
@@ -423,6 +423,20 @@
                 <option value="crypto">BTC / 加密货币</option>
                 <option value="cash">现金</option>
                 <option value="liability">负债</option>
+              </select>
+            </label>
+            <label class="filter-field">
+              <span>平台筛选</span>
+              <select id="asset-platform-filter">
+                <option value="all">全部平台</option>
+                <option value="alipay">支付宝</option>
+                <option value="southfund">南方基金</option>
+                <option value="tonghuashun">同花顺</option>
+                <option value="okx">欧易 OKX</option>
+                <option value="ibkr">IBKR</option>
+                <option value="schwab">嘉信理财</option>
+                <option value="bank">现金 / 银行</option>
+                <option value="other">其他</option>
               </select>
             </label>
             <button id="clear-filter-btn" class="ghost-button" type="button">清空筛选</button>

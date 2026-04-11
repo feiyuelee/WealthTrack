@@ -30,7 +30,8 @@ const state = {
   displayFxRates: { USD: 0 },
   timerId: null,
   filters: {
-    type: "all"
+    type: "all",
+    platform: "all"
   },
   authMode: "login",
   regionTouched: false,
@@ -539,6 +540,7 @@ function bindEvents() {
     autoRefreshCompact.addEventListener("change", handleAutoRefreshIntervalChange);
   }
   document.querySelector("#asset-type-filter").addEventListener("change", handleFilterChange);
+  document.querySelector("#asset-platform-filter").addEventListener("change", handleFilterChange);
   document.querySelector("#clear-filter-btn").addEventListener("click", clearFilters);
 
   document.querySelectorAll("[data-view-target]").forEach((button) => {
@@ -660,8 +662,7 @@ function handleEntryModeChange(event) {
   if (nextMode === "trade" || nextMode === "cash") {
     state.transactionMode = nextMode;
   }
-  syncEntryWorkspace();
-  syncTransactionFormByKind();
+  render();
 }
 
 function render() {
@@ -1082,10 +1083,13 @@ async function handleTransactionSubmit(event) {
   }
 
   const kind = String(document.querySelector("#transaction-kind")?.value || "").trim();
-  const platform = String(document.querySelector("#transaction-platform")?.value || "").trim();
+  const rawPlatform = String(document.querySelector("#transaction-platform")?.value || "").trim();
   const selectedAssetId = String(document.querySelector("#transaction-asset-id")?.value || "").trim();
   const selectedAsset = state.assets.find((item) => item.id === selectedAssetId)
     || (state.editingTransactionAsset && state.editingTransactionAsset.id === selectedAssetId ? state.editingTransactionAsset : null);
+  const platform = (kind === "buy" || kind === "sell")
+    ? String(selectedAsset?.platform || rawPlatform).trim()
+    : rawPlatform;
   const currency = String(selectedAsset?.currency || getPlatformCurrency(platform)).trim().toUpperCase();
   if (currency !== "CNY") {
     try {
@@ -1118,9 +1122,19 @@ async function handleTransactionSubmit(event) {
     showToast("请先选择交易类型和平台");
     return;
   }
-  if ((payload.kind === "buy" || payload.kind === "sell") && (!selectedAsset || payload.quantity <= 0 || payload.price <= 0)) {
-    showToast("买卖交易请先从已有资产中选择一项，并填写数量和价格");
-    return;
+  if (payload.kind === "buy" || payload.kind === "sell") {
+    if (!selectedAsset) {
+      showToast("请先从已有资产中选择一项");
+      return;
+    }
+    if (payload.quantity <= 0) {
+      showToast("请填写正确的交易数量");
+      return;
+    }
+    if (payload.price <= 0) {
+      showToast("请填写正确的成交价");
+      return;
+    }
   }
   if ((payload.kind === "deposit" || payload.kind === "withdraw") && payload.cashAmount <= 0) {
     showToast("入金或出金金额必须大于 0");
@@ -1128,14 +1142,18 @@ async function handleTransactionSubmit(event) {
   }
 
   const isEditingTransaction = Boolean(state.editingTransactionId);
-  await apiFetch(isEditingTransaction ? `/api/transactions/${encodeURIComponent(state.editingTransactionId)}` : "/api/transactions", {
-    method: isEditingTransaction ? "PUT" : "POST",
-    body: JSON.stringify(payload)
-  });
-  await refreshPortfolioState({ renderAfter: false });
-  resetTransactionForm();
-  render();
-  showToast(isEditingTransaction ? "记录已更新" : (payload.kind === "buy" || payload.kind === "sell" ? "交易已记录并同步持仓" : "资金流水已记录"));
+  try {
+    await apiFetch(isEditingTransaction ? `/api/transactions/${encodeURIComponent(state.editingTransactionId)}` : "/api/transactions", {
+      method: isEditingTransaction ? "PUT" : "POST",
+      body: JSON.stringify(payload)
+    });
+    await refreshPortfolioState({ renderAfter: false });
+    resetTransactionForm();
+    render();
+    showToast(isEditingTransaction ? "记录已更新" : (payload.kind === "buy" || payload.kind === "sell" ? "交易已记录并同步持仓" : "资金流水已记录"));
+  } catch (error) {
+    showToast(error.message || "记录交易失败");
+  }
 }
 
 function renderPlatformSummary(assets) {
@@ -2222,21 +2240,29 @@ function setupAutoRefresh() {
 }
 
 function handleFilterChange(event) {
-  state.filters.type = event.target.value;
+  if (event.target.id === "asset-type-filter") {
+    state.filters.type = event.target.value;
+  }
+  if (event.target.id === "asset-platform-filter") {
+    state.filters.platform = event.target.value;
+  }
   render();
 }
 
 function clearFilters() {
   state.filters.type = "all";
+  state.filters.platform = "all";
   document.querySelector("#asset-type-filter").value = "all";
+  document.querySelector("#asset-platform-filter").value = "all";
   render();
 }
 
 function getFilteredAssets() {
-  if (state.filters.type === "all") {
-    return state.assets;
-  }
-  return state.assets.filter((asset) => asset.type === state.filters.type);
+  return state.assets.filter((asset) => {
+    const matchesType = state.filters.type === "all" || asset.type === state.filters.type;
+    const matchesPlatform = state.filters.platform === "all" || asset.platform === state.filters.platform;
+    return matchesType && matchesPlatform;
+  });
 }
 
 function getCurrentValue(asset) {
