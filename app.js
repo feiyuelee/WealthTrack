@@ -16,10 +16,12 @@ const state = {
   editingTransactionId: "",
   editingTransactionAsset: null,
   weeklySummary: createEmptyWeeklySummary(),
+  growthSummary: null,
+  growthRangeDays: 7,
   settings: {
     finnhubKey: "",
     tushareToken: "",
-    autoRefreshInterval: 300,
+    autoRefreshInterval: 60,
     lastSyncAt: "",
     canEdit: false
   },
@@ -557,6 +559,9 @@ function bindEvents() {
   document.querySelector("#asset-type-filter").addEventListener("change", handleFilterChange);
   document.querySelector("#asset-platform-filter").addEventListener("change", handleFilterChange);
   document.querySelector("#clear-filter-btn").addEventListener("click", clearFilters);
+  document.querySelectorAll("[data-growth-range]").forEach((button) => {
+    button.addEventListener("click", handleGrowthRangeChange);
+  });
 
   document.querySelectorAll("[data-view-target]").forEach((button) => {
     button.addEventListener("click", handleViewChange);
@@ -602,6 +607,7 @@ async function loadServerData() {
   unlockAppForUser();
   render();
   await refreshWeeklySummary({ renderAfter: true });
+  await refreshGrowthSummary({ renderAfter: true });
   await refreshProviderStatuses({ silent: true });
   setupAutoRefresh();
 
@@ -650,6 +656,7 @@ async function refreshPortfolioState(options = {}) {
   state.transactions = transactionsResponse.transactions || [];
   state.accountOverviewCurrency = inferAccountOverviewCurrency();
   await refreshWeeklySummary({ renderAfter: false });
+  await refreshGrowthSummary({ renderAfter: false });
   if (renderAfter) {
     render();
   }
@@ -689,6 +696,7 @@ function render() {
   renderRecordPanelTitle();
   renderSummary(filteredAssets);
   renderWeeklySummary();
+  renderGrowthSummary();
   renderTransactionHistory();
   renderHomepageAssetDistribution(filteredAssets);
   renderHomepagePlatformProfit(filteredAssets);
@@ -785,9 +793,9 @@ function renderWeeklySummary() {
 
   setText("#weekly-profit", getMaskedSensitiveText(formatCurrency(summary.profit)));
   setText("#weekly-profit-note", note);
-  setText("#hero-total-profit-rate", `${formatSignedNumber(summary.profitRate)}%`);
+  setText("#hero-weekly-profit", getMaskedSensitiveText(formatCurrency(summary.profit)));
   applyNumberTone(document.querySelector("#weekly-profit"), summary.profit);
-  applyNumberTone(document.querySelector("#hero-total-profit-rate"), summary.profitRate);
+  applyNumberTone(document.querySelector("#hero-weekly-profit"), summary.profit);
 }
 
 async function refreshWeeklySummary(options = {}) {
@@ -814,6 +822,117 @@ async function refreshWeeklySummary(options = {}) {
   if (renderAfter) {
     renderWeeklySummary();
   }
+}
+
+async function refreshGrowthSummary(options = {}) {
+  const { renderAfter = true } = options;
+  if (!state.user) {
+    state.growthSummary = null;
+    if (renderAfter) {
+      renderGrowthSummary();
+    }
+    return;
+  }
+
+  try {
+    const response = await apiFetch(`/api/summary/growth?range_days=${encodeURIComponent(state.growthRangeDays)}`);
+    state.growthSummary = response.growth || null;
+  } catch (error) {
+    console.error("Failed to refresh growth summary", error);
+    state.growthSummary = null;
+  }
+
+  if (renderAfter) {
+    renderGrowthSummary();
+  }
+}
+
+function renderGrowthSummary() {
+  const container = document.querySelector("#growth-chart");
+  document.querySelectorAll("[data-growth-range]").forEach((button) => {
+    const isActive = Number(button.dataset.growthRange) === Number(state.growthRangeDays);
+    button.classList.toggle("is-active", isActive);
+    button.setAttribute("aria-pressed", isActive ? "true" : "false");
+  });
+  if (!container) {
+    return;
+  }
+
+  const growth = state.growthSummary;
+  if (!growth || !Array.isArray(growth.points) || !growth.points.length) {
+    container.innerHTML = '<p class="growth-chart__empty">暂无可用快照，后续会自动积累。</p>';
+    return;
+  }
+
+  const points = growth.points;
+  const baseValue = Number(points[0]?.totalAssets) || 0;
+  const values = points.map((point) => {
+    const totalAssets = Number(point.totalAssets) || 0;
+    if (!baseValue) {
+      return 0;
+    }
+    return ((totalAssets - baseValue) / baseValue) * 100;
+  });
+  const minValue = Math.min(...values);
+  const maxValue = Math.max(...values);
+  const range = maxValue - minValue || 1;
+  const width = 760;
+  const height = 200;
+  const paddingLeft = 56;
+  const paddingRight = 18;
+  const paddingTop = 12;
+  const paddingBottom = 28;
+  const innerWidth = width - paddingLeft - paddingRight;
+  const innerHeight = height - paddingTop - paddingBottom;
+  const axisTickValues = [maxValue, minValue + range / 2, minValue];
+  const tickLines = axisTickValues.map((value) => {
+    return {
+      y: roundTo(paddingTop + innerHeight - ((value - minValue) / range) * innerHeight, 2),
+      label: `${formatSignedNumber(value)}%`,
+    };
+  });
+  const polyline = values.map((value, index) => {
+    const x = paddingLeft + (points.length === 1 ? innerWidth / 2 : (index / (points.length - 1)) * innerWidth);
+    const y = paddingTop + innerHeight - ((value - minValue) / range) * innerHeight;
+    return `${roundTo(x, 2)},${roundTo(y, 2)}`;
+  }).join(" ");
+  const area = `${paddingLeft},${height - paddingBottom} ${polyline} ${paddingLeft + innerWidth},${height - paddingBottom}`;
+  const firstPoint = polyline.split(" ")[0] || "";
+  const lastPoint = polyline.split(" ").slice(-1)[0] || "";
+  const [firstX = paddingLeft, firstY = height - paddingBottom] = firstPoint.split(",").map(Number);
+  const [lastX = paddingLeft + innerWidth, lastY = height - paddingBottom] = lastPoint.split(",").map(Number);
+  const startDateLabel = formatChartDateLabel(points[0]?.date);
+  const endDateLabel = formatChartDateLabel(points[points.length - 1]?.date);
+
+  container.innerHTML = `
+    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="资产走势图">
+      <defs>
+        <linearGradient id="growth-line-fill" x1="0" x2="0" y1="0" y2="1">
+          <stop offset="0%" stop-color="rgba(184, 92, 56, 0.30)"></stop>
+          <stop offset="100%" stop-color="rgba(184, 92, 56, 0.02)"></stop>
+        </linearGradient>
+      </defs>
+      ${tickLines.map((tick) => `
+        <line x1="${paddingLeft}" y1="${tick.y}" x2="${paddingLeft + innerWidth}" y2="${tick.y}" stroke="rgba(92,58,34,0.09)" stroke-width="1" stroke-dasharray="4 6"></line>
+        <text x="${paddingLeft - 10}" y="${tick.y + 4}" fill="#8a7463" font-size="11" text-anchor="end">${escapeHtml(tick.label)}</text>
+      `).join("")}
+      <polygon points="${area}" fill="url(#growth-line-fill)"></polygon>
+      <polyline points="${polyline}" fill="none" stroke="#b85c38" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"></polyline>
+      <circle cx="${roundTo(firstX, 2)}" cy="${roundTo(firstY, 2)}" r="4" fill="#fff7f1" stroke="#b85c38" stroke-width="2"></circle>
+      <circle cx="${roundTo(lastX, 2)}" cy="${roundTo(lastY, 2)}" r="4.5" fill="#fff7f1" stroke="#b85c38" stroke-width="2.4"></circle>
+      <text x="${paddingLeft}" y="${height - 6}" fill="#8a7463" font-size="12">${escapeHtml(startDateLabel)}</text>
+      <text x="${paddingLeft + innerWidth}" y="${height - 6}" fill="#8a7463" font-size="12" text-anchor="end">${escapeHtml(endDateLabel)}</text>
+    </svg>
+  `;
+}
+
+async function handleGrowthRangeChange(event) {
+  const nextRange = Number(event.currentTarget.dataset.growthRange);
+  if (!Number.isFinite(nextRange) || nextRange === state.growthRangeDays) {
+    return;
+  }
+  state.growthRangeDays = nextRange;
+  await refreshGrowthSummary({ renderAfter: true });
 }
 
 function syncTransactionFormByKind() {
@@ -1663,7 +1782,7 @@ async function saveSettings() {
 }
 
 function handleAutoRefreshIntervalChange(event) {
-  const nextInterval = Number(event.target.value) || 300;
+  const nextInterval = Number(event.target.value) || 60;
   state.settings.autoRefreshInterval = nextInterval;
   setupAutoRefresh();
   syncAutoRefreshControl();
@@ -1672,7 +1791,7 @@ function handleAutoRefreshIntervalChange(event) {
 
 function cycleAutoRefreshInterval() {
   const intervals = [60, 180, 300, 600];
-  const current = Number(state.settings.autoRefreshInterval) || 300;
+  const current = Number(state.settings.autoRefreshInterval) || 60;
   const currentIndex = intervals.indexOf(current);
   const nextInterval = intervals[(currentIndex + 1 + intervals.length) % intervals.length];
   state.settings.autoRefreshInterval = nextInterval;
@@ -2199,7 +2318,7 @@ function formatUnitPrice(value, source, currency) {
 function hydrateSettings() {
   document.querySelector("#alpha-vantage-key").value = state.settings.finnhubKey || "";
   document.querySelector("#tushare-token").value = state.settings.tushareToken || "";
-  state.settings.autoRefreshInterval = 300;
+  state.settings.autoRefreshInterval = state.settings.autoRefreshInterval || 60;
   document.querySelector("#display-currency").value = state.displayCurrency;
   syncAutoRefreshControl();
   updateLastSyncLabel();
@@ -2239,22 +2358,22 @@ function syncSettingsAccess() {
 function syncAutoRefreshControl() {
   const autoRefreshCompact = document.querySelector("#auto-refresh-compact");
   if (autoRefreshCompact) {
-    autoRefreshCompact.value = String(state.settings.autoRefreshInterval || 300);
+    autoRefreshCompact.value = String(state.settings.autoRefreshInterval || 60);
   }
   const autoRefreshSidebar = document.querySelector("#auto-refresh-sidebar");
   if (autoRefreshSidebar) {
-    autoRefreshSidebar.value = String(state.settings.autoRefreshInterval || 300);
+    autoRefreshSidebar.value = String(state.settings.autoRefreshInterval || 60);
   }
   const autoRefreshCycle = document.querySelector("#auto-refresh-cycle");
   if (autoRefreshCycle) {
-    const label = getAutoRefreshLabel(state.settings.autoRefreshInterval || 300);
+    const label = getAutoRefreshLabel(state.settings.autoRefreshInterval || 60);
     autoRefreshCycle.textContent = label;
     autoRefreshCycle.setAttribute("aria-label", `自动刷新间隔，当前 ${label}，点击切换`);
     autoRefreshCycle.title = `自动刷新间隔：${label}`;
   }
   const autoRefreshCyclePrimary = document.querySelector("#auto-refresh-cycle-primary");
   if (autoRefreshCyclePrimary) {
-    const label = getAutoRefreshLabel(state.settings.autoRefreshInterval || 300);
+    const label = getAutoRefreshLabel(state.settings.autoRefreshInterval || 60);
     autoRefreshCyclePrimary.textContent = label;
     autoRefreshCyclePrimary.setAttribute("aria-label", `自动刷新间隔，当前 ${label}，点击切换`);
     autoRefreshCyclePrimary.title = `自动刷新间隔：${label}`;
@@ -4173,6 +4292,17 @@ function formatNumber(value) {
 function formatSignedNumber(value) {
   const normalized = Number.isFinite(value) ? value : 0;
   return normalized >= 0 ? `+${normalized.toFixed(2)}` : normalized.toFixed(2);
+}
+
+function formatChartDateLabel(value) {
+  if (!value) {
+    return "--";
+  }
+  const [year, month, day] = String(value).split("-");
+  if (!month || !day) {
+    return String(value);
+  }
+  return `${month}-${day}`;
 }
 
 function getMaskedSensitiveText(value, hiddenValue = "****") {

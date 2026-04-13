@@ -8,6 +8,7 @@ import os
 import re
 import secrets
 import sqlite3
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -39,6 +40,9 @@ DEFAULT_FINNHUB_KEY = "d797klhr01qqpmhfoog0d797klhr01qqpmhfoogg"
 DEFAULT_TUSHARE_TOKEN = "25790f70139144b663e37f1806836ba2a55bf0adb90e4bfb9dd85873"
 BINANCE_PUBLIC_BASE_URLS = ["https://data-api.binance.vision", "https://api.binance.com"]
 BEIJING_TZ = ZoneInfo("Asia/Shanghai")
+AUTO_REFRESH_INTERVAL_SECONDS = 3600
+auto_refresh_stop_event = threading.Event()
+auto_refresh_thread: threading.Thread | None = None
 
 
 def now_iso() -> str:
@@ -62,6 +66,11 @@ def get_today_beijing_date() -> str:
 def get_week_start_date(date_text: str) -> str:
     current_date = datetime.strptime(date_text, "%Y-%m-%d").date()
     return (current_date - timedelta(days=current_date.weekday())).isoformat()
+
+
+def get_growth_start_date(end_date_text: str, days: int) -> str:
+    end_date = datetime.strptime(end_date_text, "%Y-%m-%d").date()
+    return (end_date - timedelta(days=max(days - 1, 0))).isoformat()
 
 
 def get_platform_currency(platform: str) -> str:
@@ -602,7 +611,17 @@ app.add_middleware(
 
 @app.on_event("startup")
 def on_startup() -> None:
+    global auto_refresh_thread
     init_db()
+    auto_refresh_stop_event.clear()
+    if auto_refresh_thread is None or not auto_refresh_thread.is_alive():
+        auto_refresh_thread = threading.Thread(target=run_hourly_portfolio_refresh, daemon=True)
+        auto_refresh_thread.start()
+
+
+@app.on_event("shutdown")
+def on_shutdown() -> None:
+    auto_refresh_stop_event.set()
 
 
 def get_current_user(session_cookie: str | None) -> sqlite3.Row:
@@ -740,6 +759,88 @@ def update_asset_quote_fields(conn: sqlite3.Connection, user_id: int, payload: A
         (payload.id, user_id),
     ).fetchone()
     return row_to_asset_payload(row) if row else None
+
+
+def refresh_assets_with_settings(
+    conn: sqlite3.Connection,
+    user_id: int,
+    settings: sqlite3.Row,
+    assets: list[AssetPayload],
+) -> tuple[int, int]:
+    if not assets:
+        return 0, 0
+
+    worker_count = max(1, min(6, len(assets)))
+
+    def refresh_one(asset: AssetPayload) -> tuple[AssetPayload, bool]:
+        try:
+            quote = resolve_quote(asset, settings)
+            quote_fetched_at = quote.get("quoteFetchedAt") or now_iso()
+            updated_asset = asset.model_copy(
+                update={
+                    "currentPrice": quote.get("currentPrice", asset.currentPrice),
+                    "previousClose": quote.get("previousClose", asset.previousClose),
+                    "symbol": quote.get("normalizedSymbol") or asset.symbol,
+                    "quoteSource": quote.get("quoteSource") or asset.quoteSource,
+                    "quoteDate": quote.get("quoteDate") if "quoteDate" in quote else "",
+                    "quoteFetchedAt": quote_fetched_at,
+                    "updatedAt": now_iso(),
+                }
+            )
+            return updated_asset, True
+        except Exception:
+            return asset, False
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        results = list(executor.map(refresh_one, assets))
+
+    success_count = 0
+    failure_count = 0
+    for asset, ok in results:
+        if ok:
+            success_count += 1
+            update_asset_quote_fields(conn, user_id, asset)
+        else:
+            failure_count += 1
+    return success_count, failure_count
+
+
+def run_hourly_portfolio_refresh() -> None:
+    while not auto_refresh_stop_event.is_set():
+        try:
+            with closing(get_db()) as conn:
+                settings = get_shared_settings(conn)
+                user_rows = conn.execute("SELECT id FROM users").fetchall()
+                for user_row in user_rows:
+                    user_id = int(user_row["id"])
+                    bootstrap_legacy_records_for_user(conn, user_id)
+                    asset_rows = conn.execute(
+                        """
+                        SELECT id, name, platform, type, symbol, quantity, cost_price, current_price,
+                               previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
+                        FROM assets
+                        WHERE user_id = ?
+                        """,
+                        (user_id,),
+                    ).fetchall()
+                    assets = [row_to_asset_payload(row) for row in asset_rows]
+                    refresh_assets_with_settings(conn, user_id, settings, assets)
+                    ensure_portfolio_snapshot_for_date(conn, user_id, get_today_beijing_date())
+
+                conn.execute(
+                    """
+                    UPDATE user_settings
+                    SET last_sync_at = ?
+                    WHERE user_id = ?
+                    """,
+                    (now_iso(), get_admin_user_id(conn)),
+                )
+                conn.commit()
+        except Exception as exc:
+            print(f"[hourly-refresh] failed: {exc}")
+
+        if auto_refresh_stop_event.wait(AUTO_REFRESH_INTERVAL_SECONDS):
+            break
 
 
 def row_to_transaction_payload(row: sqlite3.Row) -> TransactionPayload:
@@ -2138,6 +2239,59 @@ def get_weekly_summary(session_cookie: str | None = Cookie(default=None, alias=S
     }
 
 
+@app.get("/api/summary/growth")
+def get_growth_summary(
+    range_days: int = 30,
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    today = get_today_beijing_date()
+    normalized_days = 3650 if range_days <= 0 else min(max(range_days, 2), 3650)
+    start_date = get_growth_start_date(today, normalized_days)
+
+    with closing(get_db()) as conn:
+        ensure_portfolio_snapshot_for_date(conn, int(user["id"]), today)
+        rows = conn.execute(
+            """
+            SELECT snapshot_date, total_assets
+            FROM portfolio_snapshots
+            WHERE user_id = ? AND snapshot_date >= ? AND snapshot_date <= ?
+            ORDER BY snapshot_date ASC
+            """,
+            (int(user["id"]), start_date, today),
+        ).fetchall()
+        conn.commit()
+
+    points = [
+        {
+            "date": row["snapshot_date"],
+            "totalAssets": float(row["total_assets"] or 0),
+        }
+        for row in rows
+    ]
+    if not points:
+        points = [{"date": today, "totalAssets": 0.0}]
+
+    start_value = float(points[0]["totalAssets"])
+    end_value = float(points[-1]["totalAssets"])
+    change_value = end_value - start_value
+    change_rate = (change_value / abs(start_value) * 100) if abs(start_value) > 0 else 0.0
+
+    return {
+        "growth": {
+            "rangeDays": range_days,
+            "resolvedRangeDays": normalized_days,
+            "startDate": points[0]["date"],
+            "endDate": points[-1]["date"],
+            "startValue": start_value,
+            "endValue": end_value,
+            "changeValue": change_value,
+            "changeRate": change_rate,
+            "points": points,
+        }
+    }
+
+
 @app.post("/api/transactions")
 def create_transaction(
     payload: TransactionPayload,
@@ -2327,43 +2481,23 @@ def quote_refresh_batch(
 
     with closing(get_db()) as conn:
         settings = get_shared_settings(conn)
-
-    refreshed_assets: list[dict[str, Any]] = []
-    success_count = 0
-    failure_count = 0
-    worker_count = max(1, min(6, len(assets)))
-
-    def refresh_one(asset: AssetPayload) -> tuple[AssetPayload, bool]:
-        try:
-            quote = resolve_quote(asset, settings)
-            quote_fetched_at = quote.get("quoteFetchedAt") or now_iso()
-            updated_asset = asset.model_copy(
-                update={
-                    "currentPrice": quote.get("currentPrice", asset.currentPrice),
-                    "previousClose": quote.get("previousClose", asset.previousClose),
-                    "symbol": quote.get("normalizedSymbol") or asset.symbol,
-                    "quoteSource": quote.get("quoteSource") or asset.quoteSource,
-                    "quoteDate": quote.get("quoteDate") if "quoteDate" in quote else "",
-                    "quoteFetchedAt": quote_fetched_at,
-                    "updatedAt": now_iso(),
-                }
-            )
-            return updated_asset, True
-        except Exception:
-            return asset, False
-
-    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-        results = list(executor.map(refresh_one, assets))
-
+    refreshed_assets = [asset.model_dump() for asset in assets]
     with closing(get_db()) as conn:
-        for asset, ok in results:
-            if ok:
-                success_count += 1
-                persisted_asset = update_asset_quote_fields(conn, int(user["id"]), asset)
-                refreshed_assets.append((persisted_asset or asset).model_dump())
-            else:
-                failure_count += 1
-                refreshed_assets.append(asset.model_dump())
+        success_count, failure_count = refresh_assets_with_settings(conn, int(user["id"]), settings, assets)
+        refreshed_assets = [
+            row_to_asset_payload(row).model_dump()
+            for row in conn.execute(
+                """
+                SELECT id, name, platform, type, symbol, quantity, cost_price, current_price,
+                       previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
+                FROM assets
+                WHERE user_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (int(user["id"]),),
+            ).fetchall()
+        ]
+        ensure_portfolio_snapshot_for_date(conn, int(user["id"]), get_today_beijing_date())
         conn.commit()
 
     return {

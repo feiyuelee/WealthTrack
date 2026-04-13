@@ -101,18 +101,21 @@
       <section class="view-panel is-active" data-view="dashboard">
         <section class="hero panel">
           <div class="hero-copy">
-            <div id="asset-distribution-card" class="distribution-card">
-              <div class="distribution-card__head">
-                <span>资产分布</span>
-                <div class="distribution-card__actions">
-                  <small id="asset-distribution-total">暂无数据</small>
+            <section class="growth-panel growth-panel--hero">
+              <div class="growth-panel__header">
+                <div>
+                  <span class="section-tag">资产走势</span>
+                </div>
+                <div class="growth-panel__filters" role="group" aria-label="资产走势图范围">
+                  <button type="button" class="ghost-button growth-filter-button is-active" data-growth-range="7">7天</button>
+                  <button type="button" class="ghost-button growth-filter-button" data-growth-range="30">30天</button>
+                  <button type="button" class="ghost-button growth-filter-button" data-growth-range="0">全部</button>
                 </div>
               </div>
-              <div class="distribution-card__body">
-                <div id="asset-distribution-chart" class="distribution-card__chart"></div>
-                <div id="asset-distribution-legend" class="distribution-card__legend"></div>
+              <div class="growth-chart-shell">
+                <div id="growth-chart" class="growth-chart"></div>
               </div>
-            </div>
+            </section>
           </div>
           <div class="hero-card">
             <div class="hero-card__top">
@@ -129,8 +132,8 @@
                 <strong id="hero-daily-profit-rate">0.00%</strong>
               </div>
               <div>
-                <span>本周收益率</span>
-                <strong id="hero-total-profit-rate">0.00%</strong>
+                <span>本周收益</span>
+                <strong id="hero-weekly-profit">¥0.00</strong>
               </div>
             </div>
           </div>
@@ -140,42 +143,6 @@
           <div id="platform-profit-compact" class="platform-profit-strip"></div>
         </section>
 
-        <section class="panel">
-          <div class="panel-header">
-            <div>
-              <h2>账户总览</h2>
-            </div>
-            <span id="display-currency-badge-summary" class="display-currency-badge">CNY</span>
-          </div>
-          <div id="dashboard-risk-banner" class="risk-banner hidden"></div>
-          <div class="stats-grid">
-            <article class="stat-card">
-              <span>净资产</span>
-              <strong id="total-assets">¥0.00</strong>
-              <small>资产减去负债后的总额</small>
-            </article>
-            <article class="stat-card">
-              <span>今日收益</span>
-              <strong id="daily-profit">¥0.00</strong>
-              <small>基于昨收或昨日净值估算</small>
-            </article>
-            <article class="stat-card">
-              <span>本周收益</span>
-              <strong id="weekly-profit">¥0.00</strong>
-              <small id="weekly-profit-note">周一至今 · +0.00%</small>
-            </article>
-            <article class="stat-card">
-              <span>融资金额</span>
-              <strong id="total-margin">¥0.00</strong>
-              <small>所有账户融资占用合计</small>
-            </article>
-            <article class="stat-card">
-              <span>账户余额</span>
-              <strong id="total-cash-balance">¥0.00</strong>
-              <small>所有账户正向自由资金合计</small>
-            </article>
-          </div>
-        </section>
       </section>
 
       <div id="platform-profit-modal" class="modal hidden" aria-hidden="true">
@@ -391,12 +358,62 @@
 
       <section class="view-panel" data-view="platforms">
         <section class="panel">
+          <div class="panel-header">
+            <div>
+              <h2>账户总览</h2>
+            </div>
+            <span id="display-currency-badge-summary" class="display-currency-badge">CNY</span>
+          </div>
+          <div id="dashboard-risk-banner" class="risk-banner hidden"></div>
+          <div class="stats-grid">
+            <article class="stat-card">
+              <span>净资产</span>
+              <strong id="total-assets">¥0.00</strong>
+              <small>资产减去负债后的总额</small>
+            </article>
+            <article class="stat-card">
+              <span>今日收益</span>
+              <strong id="daily-profit">¥0.00</strong>
+              <small>基于昨收或昨日净值估算</small>
+            </article>
+            <article class="stat-card">
+              <span>本周收益</span>
+              <strong id="weekly-profit">¥0.00</strong>
+              <small id="weekly-profit-note">周一至今 · +0.00%</small>
+            </article>
+            <article class="stat-card">
+              <span>融资金额</span>
+              <strong id="total-margin">¥0.00</strong>
+              <small>所有账户融资占用合计</small>
+            </article>
+            <article class="stat-card">
+              <span>账户余额</span>
+              <strong id="total-cash-balance">¥0.00</strong>
+              <small>所有账户正向自由资金合计</small>
+            </article>
+          </div>
+        </section>
+        <section class="panel">
           <div id="platform-summary-grid" class="stats-grid">
             <article class="stat-card">
               <span>暂无账户数据</span>
               <strong>¥0.00</strong>
               <small>录入资产后会自动汇总</small>
             </article>
+          </div>
+        </section>
+        <section class="panel">
+          <div id="asset-distribution-card" class="distribution-card">
+            <div class="distribution-card__head">
+              <span>资产分布</span>
+              <div class="distribution-card__actions">
+                <small id="asset-distribution-total">暂无数据</small>
+              </div>
+            </div>
+            <div class="distribution-card__body">
+              <div id="asset-distribution-chart" class="distribution-card__chart"></div>
+              <div id="asset-distribution-legend" class="distribution-card__legend"></div>
+            </div>
           </div>
         </section>
       </section>
