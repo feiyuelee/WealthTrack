@@ -690,6 +690,13 @@ def get_external_api_user(
     return user
 
 
+def external_json_response(payload: Any) -> Response:
+    return Response(
+        content=json.dumps(payload, ensure_ascii=True, separators=(",", ":")),
+        media_type="application/json; charset=utf-8",
+    )
+
+
 def save_asset_record(conn: sqlite3.Connection, user_id: int, payload: AssetPayload) -> None:
     conn.execute(
         """
@@ -2274,7 +2281,7 @@ def external_portfolio(
     session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
     authorization: str | None = Header(default=None),
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
-) -> dict[str, Any]:
+) -> Response:
     user = get_external_api_user(username, user_id, session_cookie, authorization, x_api_key, token)
     user_id = int(user["id"])
 
@@ -2370,23 +2377,25 @@ def external_portfolio(
             }
         )
 
-    return {
-        "account": {
-            "username": user["username"],
-            "generatedAt": now_iso(),
-            "baseCurrency": "CNY",
-        },
-        "summary": {
-            "totalAssetsCny": totals["totalAssets"],
-            "totalCostCny": totals["totalCost"],
-            "totalProfitCny": totals["totalProfit"],
-            "totalMarginCny": totals["totalMargin"],
-            "totalCashBalanceCny": totals["totalCashBalance"],
-        },
-        "assets": assets,
-        "accountBalances": account_balances,
-        "recentTransactions": recent_transactions,
-    }
+    return external_json_response(
+        {
+            "account": {
+                "username": user["username"],
+                "generatedAt": now_iso(),
+                "baseCurrency": "CNY",
+            },
+            "summary": {
+                "totalAssetsCny": totals["totalAssets"],
+                "totalCostCny": totals["totalCost"],
+                "totalProfitCny": totals["totalProfit"],
+                "totalMarginCny": totals["totalMargin"],
+                "totalCashBalanceCny": totals["totalCashBalance"],
+            },
+            "assets": assets,
+            "accountBalances": account_balances,
+            "recentTransactions": recent_transactions,
+        }
+    )
 
 
 @app.get("/api/external/portfolio-link")
