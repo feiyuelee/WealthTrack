@@ -16,10 +16,10 @@ from pathlib import Path
 from time import sleep, time
 from typing import Any
 from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+from urllib.request import Request as UrlRequest, urlopen
 from zoneinfo import ZoneInfo
 
-from fastapi import Cookie, FastAPI, HTTPException, Response
+from fastapi import Cookie, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -32,6 +32,8 @@ DB_PATH = DATA_DIR / "wealthtrack.db"
 SESSION_COOKIE = "wealthtrack_session"
 SESSION_TTL_DAYS = 14
 APP_SECRET = os.environ.get("WEALTHTRACK_SECRET", "change-me-in-production")
+EXTERNAL_API_KEY = os.environ.get("WEALTHTRACK_EXTERNAL_API_KEY", "").strip()
+EXTERNAL_API_KEY_FILE = DATA_DIR / "external_api_key.txt"
 PROVIDER_STATUS_CACHE_TTL_SECONDS = 300
 provider_status_cache: dict[str, Any] = {"key": None, "expires_at": 0.0, "providers": None}
 ADMIN_USERNAME = "admin"
@@ -439,7 +441,7 @@ def verify_session_token(token: str) -> int:
 
 
 def read_json_url(url: str) -> Any:
-    request = Request(
+    request = UrlRequest(
         url,
         headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -464,7 +466,7 @@ def read_eastmoney_json_url(url: str) -> Any:
     last_error: Exception | None = None
     for attempt in range(2):
         try:
-            request = Request(url, headers=headers)
+            request = UrlRequest(url, headers=headers)
             with urlopen(request, timeout=20) as response:
                 return json.load(response)
         except Exception as exc:
@@ -475,7 +477,7 @@ def read_eastmoney_json_url(url: str) -> Any:
 
 
 def read_text_url(url: str) -> str:
-    request = Request(
+    request = UrlRequest(
         url,
         headers={
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -613,6 +615,7 @@ app.add_middleware(
 def on_startup() -> None:
     global auto_refresh_thread
     init_db()
+    resolve_external_api_key()
     auto_refresh_stop_event.clear()
     if auto_refresh_thread is None or not auto_refresh_thread.is_alive():
         auto_refresh_thread = threading.Thread(target=run_hourly_portfolio_refresh, daemon=True)
@@ -632,6 +635,58 @@ def get_current_user(session_cookie: str | None) -> sqlite3.Row:
         user = conn.execute("SELECT id, username, created_at FROM users WHERE id = ?", (user_id,)).fetchone()
     if not user:
         raise HTTPException(status_code=401, detail="用户不存在")
+    return user
+
+
+def resolve_external_api_key() -> str:
+    if EXTERNAL_API_KEY:
+        return EXTERNAL_API_KEY
+    if EXTERNAL_API_KEY_FILE.exists():
+        return EXTERNAL_API_KEY_FILE.read_text(encoding="utf-8").strip()
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    generated_key = secrets.token_urlsafe(32)
+    EXTERNAL_API_KEY_FILE.write_text(f"{generated_key}\n", encoding="utf-8")
+    return generated_key
+
+
+def parse_bearer_token(authorization: str | None) -> str:
+    value = str(authorization or "").strip()
+    if value.lower().startswith("bearer "):
+        return value[7:].strip()
+    return ""
+
+
+def get_external_api_user(
+    username: str,
+    user_id: int,
+    session_cookie: str | None,
+    authorization: str | None,
+    x_api_key: str | None,
+    token: str,
+) -> sqlite3.Row:
+    if session_cookie:
+        return get_current_user(session_cookie)
+
+    expected_key = resolve_external_api_key()
+    provided_key = str(token or "").strip() or str(x_api_key or "").strip() or parse_bearer_token(authorization)
+    if not provided_key or not hmac.compare_digest(provided_key, expected_key):
+        raise HTTPException(status_code=401, detail="Invalid external API key")
+
+    normalized_username = str(username or ADMIN_USERNAME).strip().lower()
+    with closing(get_db()) as conn:
+        if user_id > 0:
+            user = conn.execute(
+                "SELECT id, username, created_at FROM users WHERE id = ?",
+                (user_id,),
+            ).fetchone()
+        else:
+            user = conn.execute(
+                "SELECT id, username, created_at FROM users WHERE username = ?",
+                (normalized_username,),
+            ).fetchone()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
     return user
 
 
@@ -934,6 +989,15 @@ def upsert_transaction_record(
     )
 
 
+def compute_asset_record_cash_amount(payload: TransactionPayload | AssetPayload) -> float:
+    asset_type = str(payload.assetType if isinstance(payload, TransactionPayload) else payload.type or "").strip().lower()
+    if asset_type not in {"fund", "stock", "crypto"}:
+        return 0.0
+    quantity = float(payload.quantity or 0)
+    cost_price = float(payload.costPrice or 0)
+    return -(quantity * cost_price)
+
+
 def bootstrap_legacy_records_for_user(conn: sqlite3.Connection, user_id: int) -> None:
     asset_rows = conn.execute(
         """
@@ -1196,13 +1260,15 @@ def rebuild_portfolio_from_records(conn: sqlite3.Connection, user_id: int) -> No
         if kind == "asset":
             currency = str(payload.currency or get_platform_currency(payload.platform)).strip().upper()
             fx_rate = resolve_fx_rate_to_cny(currency, payload.fxRate)
+            platform = str(payload.platform or "").strip().lower()
+            cash_amount = float(payload.cashAmount or 0)
             save_asset_record(
                 conn,
                 user_id,
                 AssetPayload(
                     id=payload.id,
                     name=str(payload.assetName or payload.symbol).strip(),
-                    platform=str(payload.platform or "").strip().lower(),
+                    platform=platform,
                     type=str(payload.assetType or "").strip().lower(),
                     symbol=str(payload.symbol or "").strip().upper(),
                     quantity=float(payload.quantity or 0),
@@ -1218,13 +1284,29 @@ def rebuild_portfolio_from_records(conn: sqlite3.Connection, user_id: int) -> No
                     updatedAt=payload.occurredAt,
                 ),
             )
+            if abs(cash_amount) > 1e-9:
+                account_entry = get_account_balance_entry(conn, user_id, platform)
+                current_free_cash = float(account_entry["free_cash"] or 0) if account_entry else 0.0
+                display_currency = (
+                    str(account_entry["display_currency"] or "").strip().upper()
+                    if account_entry and str(account_entry["display_currency"] or "").strip()
+                    else currency
+                )
+                upsert_account_balance(
+                    conn,
+                    user_id,
+                    platform,
+                    current_free_cash + cash_amount,
+                    display_currency,
+                    payload.occurredAt,
+                )
             conn.execute(
                 """
                 UPDATE transactions
-                SET cash_amount = 0, realized_profit = 0, currency = ?, fx_rate = ?
+                SET cash_amount = ?, realized_profit = 0, currency = ?, fx_rate = ?
                 WHERE id = ? AND user_id = ?
                 """,
-                (currency, fx_rate, payload.id, user_id),
+                (cash_amount, currency, fx_rate, payload.id, user_id),
             )
             continue
 
@@ -2069,7 +2151,7 @@ def save_asset(payload: AssetPayload, session_cookie: str | None = Cookie(defaul
             previousClose=payload.previousClose,
             price=payload.currentPrice,
             fee=0,
-            cashAmount=0,
+            cashAmount=compute_asset_record_cash_amount(payload),
             currency=payload.currency,
             fxRate=payload.fxRate,
             quoteSource=payload.quoteSource,
@@ -2181,6 +2263,143 @@ def list_transactions(session_cookie: str | None = Cookie(default=None, alias=SE
         conn.commit()
         transactions = list_transactions_for_user(conn, int(user["id"]))
     return {"transactions": transactions}
+
+
+@app.get("/api/external/portfolio")
+def external_portfolio(
+    username: str = ADMIN_USERNAME,
+    user_id: int = 0,
+    token: str = "",
+    refresh: int = 0,
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+    authorization: str | None = Header(default=None),
+    x_api_key: str | None = Header(default=None, alias="X-API-Key"),
+) -> dict[str, Any]:
+    user = get_external_api_user(username, user_id, session_cookie, authorization, x_api_key, token)
+    user_id = int(user["id"])
+
+    with closing(get_db()) as conn:
+        bootstrap_legacy_records_for_user(conn, user_id)
+        if refresh:
+            asset_rows = conn.execute(
+                """
+                SELECT id, name, platform, type, symbol, quantity, cost_price, current_price,
+                       previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
+                FROM assets
+                WHERE user_id = ?
+                ORDER BY updated_at DESC
+                """,
+                (user_id,),
+            ).fetchall()
+            refresh_assets_with_settings(conn, user_id, get_shared_settings(conn), [row_to_asset_payload(row) for row in asset_rows])
+
+        ensure_portfolio_snapshot_for_date(conn, user_id, get_today_beijing_date())
+        totals = compute_portfolio_totals(conn, user_id)
+        asset_rows = conn.execute(
+            """
+            SELECT id, name, platform, type, symbol, quantity, cost_price, current_price,
+                   previous_close, currency, fx_rate, quote_source, quote_date, quote_fetched_at, notes, updated_at
+            FROM assets
+            WHERE user_id = ?
+            ORDER BY platform ASC, type ASC, name ASC
+            """,
+            (user_id,),
+        ).fetchall()
+        balance_rows = conn.execute(
+            """
+            SELECT platform, free_cash, display_currency, updated_at
+            FROM account_balances
+            WHERE user_id = ?
+            ORDER BY platform ASC
+            """,
+            (user_id,),
+        ).fetchall()
+        recent_transactions = list_transactions_for_user(conn, user_id)[:50]
+        conn.commit()
+
+    assets = []
+    for row in asset_rows:
+        current_value_cny = compute_asset_current_value(row)
+        cost_value_cny = compute_asset_cost_value(row)
+        previous_close = float(row["previous_close"] or 0)
+        current_price = float(row["current_price"] or 0)
+        daily_change_cny = 0.0
+        if previous_close > 0:
+            daily_change_cny = float(row["quantity"] or 0) * (current_price - previous_close) * float(row["fx_rate"] or 1)
+            if row["type"] == "liability":
+                daily_change_cny = -abs(daily_change_cny)
+        assets.append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "platform": row["platform"],
+                "type": row["type"],
+                "symbol": row["symbol"],
+                "quantity": row["quantity"],
+                "costPrice": row["cost_price"],
+                "currentPrice": row["current_price"],
+                "previousClose": row["previous_close"],
+                "currency": row["currency"],
+                "fxRateToCny": row["fx_rate"],
+                "costValueCny": cost_value_cny,
+                "currentValueCny": current_value_cny,
+                "unrealizedProfitCny": current_value_cny - cost_value_cny,
+                "dailyChangeCny": daily_change_cny,
+                "quoteSource": row["quote_source"],
+                "quoteDate": row["quote_date"],
+                "quoteFetchedAt": row["quote_fetched_at"],
+                "notes": row["notes"],
+                "updatedAt": row["updated_at"],
+            }
+        )
+
+    account_balances = []
+    for row in balance_rows:
+        platform = str(row["platform"] or "").strip().lower()
+        currency = str(row["display_currency"] or get_platform_currency(platform)).strip().upper()
+        fx_rate = resolve_fx_rate_to_cny(currency)
+        free_cash = float(row["free_cash"] or 0)
+        account_balances.append(
+            {
+                "platform": platform,
+                "freeCash": free_cash,
+                "currency": currency,
+                "fxRateToCny": fx_rate,
+                "freeCashCny": free_cash * fx_rate,
+                "updatedAt": row["updated_at"],
+            }
+        )
+
+    return {
+        "account": {
+            "username": user["username"],
+            "generatedAt": now_iso(),
+            "baseCurrency": "CNY",
+        },
+        "summary": {
+            "totalAssetsCny": totals["totalAssets"],
+            "totalCostCny": totals["totalCost"],
+            "totalProfitCny": totals["totalProfit"],
+            "totalMarginCny": totals["totalMargin"],
+            "totalCashBalanceCny": totals["totalCashBalance"],
+        },
+        "assets": assets,
+        "accountBalances": account_balances,
+        "recentTransactions": recent_transactions,
+    }
+
+
+@app.get("/api/external/portfolio-link")
+def external_portfolio_link(
+    request: Request,
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, str]:
+    user = get_current_user(session_cookie)
+    token = resolve_external_api_key()
+    base_url = str(request.base_url).rstrip("/")
+    query = urlencode({"user_id": int(user["id"]), "username": str(user["username"]), "token": token})
+    url = f"{base_url}/api/external/portfolio?{query}"
+    return {"url": url}
 
 
 @app.get("/api/summary/weekly")

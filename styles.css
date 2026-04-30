@@ -171,6 +171,12 @@ th {
   border-color: rgba(184, 92, 56, 0.3);
 }
 
+.sidebar-tool-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  transform: none;
+}
+
 .sidebar-tool-button--currency {
   min-width: 42px;
 }
@@ -190,6 +196,20 @@ th {
 
 .sidebar-tool-button__label {
   display: none;
+}
+
+.external-api-link-button .sidebar-tool-button__icon svg {
+  width: 18px;
+  height: 18px;
+}
+
+.clipboard-fallback {
+  position: fixed;
+  left: -9999px;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
 }
 
 .sidebar-refresh-select {

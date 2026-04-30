@@ -529,6 +529,10 @@ function bindEvents() {
   if (accountPrivacyToggle) {
     accountPrivacyToggle.addEventListener("click", toggleAccountValuesVisibility);
   }
+  const externalApiLinkButton = document.querySelector("#external-api-link-button");
+  if (externalApiLinkButton) {
+    externalApiLinkButton.addEventListener("click", copyExternalPortfolioLink);
+  }
   const compactCurrencyToggle = document.querySelector("#display-currency-compact-toggle");
   if (compactCurrencyToggle) {
     compactCurrencyToggle.addEventListener("click", () => {
@@ -689,6 +693,7 @@ function handleEntryModeChange(event) {
 
 function render() {
   const filteredAssets = getFilteredAssets();
+  renderExternalApiLinkButton();
   renderAccountPrivacyToggle();
   renderDisplayCurrencyBadges();
   syncEntryWorkspace();
@@ -4318,6 +4323,61 @@ function renderAccountPrivacyToggle() {
   button.setAttribute("aria-pressed", String(isVisible));
   button.setAttribute("aria-label", isVisible ? "Hide account overview data" : "Show account overview data");
   button.innerHTML = `<span class="privacy-toggle__icon" aria-hidden="true">${getAccountPrivacyIcon(isVisible)}</span>`;
+}
+
+function renderExternalApiLinkButton() {
+  const button = document.querySelector("#external-api-link-button");
+  if (!button) {
+    return;
+  }
+  const isEnabled = Boolean(state.user);
+  button.disabled = !isEnabled;
+  button.setAttribute("aria-disabled", String(!isEnabled));
+  button.innerHTML = `<span class="sidebar-tool-button__icon" aria-hidden="true">${getExternalApiLinkIcon()}</span>`;
+}
+
+function getExternalApiLinkIcon() {
+  return `
+    <svg viewBox="0 0 24 24" focusable="false" aria-hidden="true">
+      <path d="M10 13a5 5 0 0 0 7.1.1l2-2a5 5 0 0 0-7.1-7.1l-1.1 1.1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+      <path d="M14 11a5 5 0 0 0-7.1-.1l-2 2a5 5 0 0 0 7.1 7.1l1.1-1.1" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+    </svg>
+  `;
+}
+
+async function copyExternalPortfolioLink() {
+  if (!ensureLoggedIn()) {
+    return;
+  }
+  try {
+    const response = await apiFetch("/api/external/portfolio-link");
+    const copied = await copyTextToClipboard(response.url);
+    if (copied) {
+      showToast("AI 分析接口链接已复制");
+    } else {
+      window.prompt("复制这个 AI 分析接口链接", response.url);
+      showToast("浏览器限制自动复制，请手动复制链接");
+    }
+  } catch (error) {
+    showToast(error.message || "复制链接失败");
+  }
+}
+
+async function copyTextToClipboard(text) {
+  if (navigator.clipboard && window.isSecureContext) {
+    await navigator.clipboard.writeText(text);
+    return true;
+  }
+
+  const textarea = document.createElement("textarea");
+  textarea.value = text;
+  textarea.setAttribute("readonly", "");
+  textarea.className = "clipboard-fallback";
+  document.body.append(textarea);
+  textarea.select();
+  const copied = document.execCommand("copy");
+  textarea.remove();
+  return copied;
 }
 
 function getAccountPrivacyIcon(isVisible) {
