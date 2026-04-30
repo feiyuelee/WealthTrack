@@ -531,7 +531,7 @@ function bindEvents() {
   }
   const externalApiLinkButton = document.querySelector("#external-api-link-button");
   if (externalApiLinkButton) {
-    externalApiLinkButton.addEventListener("click", copyExternalPortfolioLink);
+    externalApiLinkButton.addEventListener("click", copyExternalPortfolioData);
   }
   const compactCurrencyToggle = document.querySelector("#display-currency-compact-toggle");
   if (compactCurrencyToggle) {
@@ -4345,21 +4345,37 @@ function getExternalApiLinkIcon() {
   `;
 }
 
-async function copyExternalPortfolioLink() {
+async function copyExternalPortfolioData() {
   if (!ensureLoggedIn()) {
     return;
   }
   try {
-    const response = await apiFetch("/api/external/portfolio-link");
-    const copied = await copyTextToClipboard(response.url);
+    const response = await fetch("/api/external/portfolio", {
+      credentials: "include",
+      headers: {
+        "Accept": "application/json"
+      }
+    });
+    if (!response.ok) {
+      let message = "获取资产数据失败";
+      try {
+        const data = await response.json();
+        message = data.detail || message;
+      } catch {
+        // ignore
+      }
+      throw new Error(message);
+    }
+    const portfolioText = await response.text();
+    const copied = await copyTextToClipboard(portfolioText);
     if (copied) {
-      showToast("AI 分析接口链接已复制");
+      showToast("AI 分析资产数据已复制");
     } else {
-      window.prompt("复制这个 AI 分析接口链接", response.url);
-      showToast("浏览器限制自动复制，请手动复制链接");
+      window.prompt("复制这份 AI 分析资产数据", portfolioText);
+      showToast("浏览器限制自动复制，请手动复制数据");
     }
   } catch (error) {
-    showToast(error.message || "复制链接失败");
+    showToast(error.message || "复制资产数据失败");
   }
 }
 
