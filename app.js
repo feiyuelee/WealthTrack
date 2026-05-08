@@ -717,9 +717,9 @@ function renderRecordPanelTitle() {
     return;
   }
   title.textContent = state.entryMode === "asset"
-    ? "新增资产记录"
+    ? "建仓记录"
     : state.entryMode === "trade"
-      ? "买卖记录"
+      ? "仓位调整记录"
       : "出入金记录";
 }
 
@@ -957,8 +957,9 @@ function syncTransactionFormByKind() {
   const isTrade = state.transactionMode !== "cash";
   const kindOptions = isTrade
     ? [
-        ["buy", "买入"],
-        ["sell", "卖出"]
+        ["buy", "加仓"],
+        ["sell", "减仓"],
+        ["close", "清仓"]
       ]
     : [
         ["deposit", "入金"],
@@ -1010,12 +1011,13 @@ function syncTransactionFormByKind() {
     }
     assetSelect.innerHTML = assets.length
       ? assets.map((asset) => `<option value="${escapeHtml(asset.id)}">${escapeHtml(asset.name)} · ${escapeHtml(asset.symbol)}</option>`).join("")
-      : '<option value="">暂无可交易资产</option>';
+      : '<option value="">暂无可调整仓位</option>';
     if (previousAssetId && assets.some((asset) => asset.id === previousAssetId)) {
       assetSelect.value = previousAssetId;
     }
   }
   syncTransactionAssetSelection();
+  syncTransactionQuantityConstraints();
 }
 
 function syncTransactionAssetSelection() {
@@ -1032,6 +1034,57 @@ function syncTransactionAssetSelection() {
   if (state.transactionMode !== "cash" && tradePlatformField && asset?.platform) {
     tradePlatformField.value = asset.platform;
   }
+  syncTransactionQuantityConstraints();
+}
+
+function getSelectedTransactionAsset() {
+  const assetSelect = document.querySelector("#transaction-asset-id");
+  const selectedAssetId = String(assetSelect?.value || "").trim();
+  return state.assets.find((item) => item.id === selectedAssetId)
+    || (state.editingTransactionAsset && state.editingTransactionAsset.id === selectedAssetId ? state.editingTransactionAsset : null);
+}
+
+function isWholeUnitAsset(asset) {
+  return asset?.type === "stock";
+}
+
+function normalizeTransactionQuantityForAsset(quantity, asset) {
+  const normalized = Number(quantity) || 0;
+  if (!isWholeUnitAsset(asset)) {
+    return normalized;
+  }
+  return Math.max(0, Math.floor(normalized + 1e-9));
+}
+
+function formatQuantityForAsset(quantity, asset) {
+  const normalized = normalizeTransactionQuantityForAsset(quantity, asset);
+  if (isWholeUnitAsset(asset)) {
+    return String(normalized);
+  }
+  return String(normalized);
+}
+
+function syncTransactionQuantityConstraints() {
+  const kind = String(document.querySelector("#transaction-kind")?.value || "").trim();
+  const quantityField = document.querySelector("#transaction-quantity");
+  const selectedAsset = getSelectedTransactionAsset();
+  if (!quantityField) {
+    return;
+  }
+
+  quantityField.readOnly = kind === "close";
+  quantityField.removeAttribute("max");
+  quantityField.step = isWholeUnitAsset(selectedAsset) ? "1" : "0.000001";
+  quantityField.placeholder = "0";
+
+  if ((kind === "sell" || kind === "close") && selectedAsset) {
+    const currentQuantity = normalizeTransactionQuantityForAsset(selectedAsset.quantity, selectedAsset);
+    quantityField.max = String(currentQuantity);
+    quantityField.placeholder = `最多 ${formatNumber(currentQuantity)}`;
+    if (kind === "close") {
+      quantityField.value = currentQuantity ? formatQuantityForAsset(currentQuantity, selectedAsset) : "";
+    }
+  }
 }
 
 function fillTransactionFormFromRecord(record) {
@@ -1043,6 +1096,7 @@ function fillTransactionFormFromRecord(record) {
         platform: record.platform,
         type: record.assetType,
         symbol: record.symbol,
+        quantity: record.quantity,
         currency: record.currency,
         quoteSource: record.quoteSource,
         quoteDate: record.quoteDate
@@ -1063,7 +1117,7 @@ function fillTransactionFormFromRecord(record) {
   const cashAmountField = document.querySelector("#transaction-cash-amount");
 
   if (kindField) {
-    kindField.value = record.kind;
+    kindField.value = record.kind === "sell" && record.notes === "close" ? "close" : record.kind;
   }
   if (platformField) {
     platformField.value = record.platform || "ibkr";
@@ -1090,6 +1144,7 @@ function fillTransactionFormFromRecord(record) {
   if (cashAmountField) {
     cashAmountField.value = Math.abs(Number(record.cashAmount) || 0) || "";
   }
+  syncTransactionQuantityConstraints();
 }
 
 function resetTransactionForm() {
@@ -1187,9 +1242,9 @@ function renderTransactionHistory() {
     });
   if (!records.length) {
     const emptyText = state.entryMode === "asset"
-      ? "还没有新增资产记录。"
+      ? "还没有建仓记录。"
       : state.entryMode === "trade"
-        ? "还没有买卖记录。"
+        ? "还没有仓位调整记录。"
         : "还没有出入金记录。";
     container.innerHTML = `<p class="transaction-history__empty">${emptyText}</p>`;
     return;
@@ -1201,11 +1256,11 @@ function renderTransactionHistory() {
       const cashValueCny = (Number(item.cashAmount) || 0) * (Number(item.fxRate) || 1);
       const realizedProfitCny = (Number(item.realizedProfit) || 0) * (Number(item.fxRate) || 1);
       const title = item.kind === "asset"
-        ? `新增资产 ${item.assetName || item.symbol}`
+        ? `建仓 ${item.assetName || item.symbol}`
         : item.kind === "buy"
-          ? `买入 ${item.assetName || item.symbol}`
+          ? `加仓 ${item.assetName || item.symbol}`
           : item.kind === "sell"
-            ? `卖出 ${item.assetName || item.symbol}`
+            ? `${item.notes === "close" ? "清仓" : "减仓"} ${item.assetName || item.symbol}`
             : item.kind === "deposit"
               ? "平台入金"
               : "平台出金";
@@ -1250,12 +1305,11 @@ async function handleTransactionSubmit(event) {
     return;
   }
 
-  const kind = String(document.querySelector("#transaction-kind")?.value || "").trim();
+  const rawKind = String(document.querySelector("#transaction-kind")?.value || "").trim();
+  const kind = rawKind === "close" ? "sell" : rawKind;
   const rawPlatform = String(document.querySelector("#transaction-platform")?.value || "").trim();
   const rawTradePlatform = String(document.querySelector("#transaction-trade-platform")?.value || "").trim();
-  const selectedAssetId = String(document.querySelector("#transaction-asset-id")?.value || "").trim();
-  const selectedAsset = state.assets.find((item) => item.id === selectedAssetId)
-    || (state.editingTransactionAsset && state.editingTransactionAsset.id === selectedAssetId ? state.editingTransactionAsset : null);
+  const selectedAsset = getSelectedTransactionAsset();
   const platform = (kind === "buy" || kind === "sell")
     ? String(selectedAsset?.platform || rawTradePlatform || rawPlatform).trim()
     : rawPlatform;
@@ -1275,7 +1329,7 @@ async function handleTransactionSubmit(event) {
     assetName: selectedAsset?.name || "",
     assetType: selectedAsset?.type || "",
     symbol: selectedAsset?.symbol || "",
-    quantity: Number(document.querySelector("#transaction-quantity")?.value) || 0,
+    quantity: normalizeTransactionQuantityForAsset(Number(document.querySelector("#transaction-quantity")?.value) || 0, selectedAsset),
     price: Number(document.querySelector("#transaction-price")?.value) || 0,
     fee: Number(document.querySelector("#transaction-fee")?.value) || 0,
     cashAmount: Number(document.querySelector("#transaction-cash-amount")?.value) || 0,
@@ -1283,22 +1337,40 @@ async function handleTransactionSubmit(event) {
     fxRate: getCurrencyFxRateToCny(currency),
     quoteSource: selectedAsset?.quoteSource || "manual",
     quoteDate: selectedAsset?.quoteDate || "",
-    notes: "",
+    notes: rawKind === "close" ? "close" : "",
     occurredAt: new Date().toISOString()
   };
 
   if (!payload.kind || !payload.platform) {
-    showToast("请先选择交易类型和平台");
+    showToast("请先选择调整类型和平台");
     return;
   }
   if (payload.kind === "buy" || payload.kind === "sell") {
     if (!selectedAsset) {
-      showToast("请先从已有资产中选择一项");
+      showToast("请先选择要调整的仓位");
       return;
     }
     if (payload.quantity <= 0) {
-      showToast("请填写正确的交易数量");
+      showToast("请填写正确的调整数量");
       return;
+    }
+    if (rawKind === "close") {
+      payload.quantity = normalizeTransactionQuantityForAsset(selectedAsset.quantity, selectedAsset);
+      const quantityField = document.querySelector("#transaction-quantity");
+      if (quantityField) {
+        quantityField.value = payload.quantity ? formatQuantityForAsset(payload.quantity, selectedAsset) : "";
+      }
+    }
+    const currentQuantity = normalizeTransactionQuantityForAsset(selectedAsset.quantity, selectedAsset);
+    if (payload.kind === "sell" && payload.quantity > currentQuantity + 1e-9) {
+      showToast("减仓数量不能大于当前持仓数量");
+      return;
+    }
+    if (isWholeUnitAsset(selectedAsset)) {
+      const quantityField = document.querySelector("#transaction-quantity");
+      if (quantityField) {
+        quantityField.value = payload.quantity ? String(payload.quantity) : "";
+      }
     }
     if (payload.price <= 0) {
       showToast("请填写正确的成交价");
@@ -1319,9 +1391,9 @@ async function handleTransactionSubmit(event) {
     await refreshPortfolioState({ renderAfter: false });
     resetTransactionForm();
     render();
-    showToast(isEditingTransaction ? "记录已更新" : (payload.kind === "buy" || payload.kind === "sell" ? "交易已记录并同步持仓" : "资金流水已记录"));
+    showToast(isEditingTransaction ? "记录已更新" : (payload.kind === "buy" || payload.kind === "sell" ? "调仓已记录并同步持仓" : "资金流水已记录"));
   } catch (error) {
-    showToast(error.message || "记录交易失败");
+    showToast(error.message || "记录调仓失败");
   }
 }
 
@@ -1471,6 +1543,11 @@ async function handleSubmit(event) {
 
   const formData = new FormData(form);
   const rawSymbol = String(formData.get("symbol")).trim().toUpperCase();
+  const normalizedSymbol = normalizeAssetSymbol(rawSymbol, String(formData.get("type")), String(formData.get("platform")));
+  const inferredCurrency = getCurrencyForAssetSymbol(normalizedSymbol, String(formData.get("currency")));
+  if (inferredCurrency !== String(formData.get("currency"))) {
+    await applyAssetCurrency(inferredCurrency);
+  }
   const existingAsset = state.assets.find((item) => item.id === formData.get("id"));
   const latestPriceField = document.querySelector("#asset-price");
   const asset = {
@@ -1478,13 +1555,13 @@ async function handleSubmit(event) {
     name: String(formData.get("name")).trim(),
     platform: String(formData.get("platform")),
     type: String(formData.get("type")),
-    symbol: normalizeAssetSymbol(rawSymbol, String(formData.get("type")), String(formData.get("platform"))),
+    symbol: normalizedSymbol,
     quantity: Number(formData.get("quantity")),
     costPrice: Number(formData.get("costPrice")),
     currentPrice: Number(formData.get("currentPrice")) || 0,
     previousClose: Number(formData.get("previousClose")) || 0,
-    currency: String(formData.get("currency")),
-    fxRate: Number(formData.get("fxRate")) || 1,
+    currency: document.querySelector("#asset-currency").value,
+    fxRate: Number(document.querySelector("#asset-fx-rate").value) || 1,
     quoteSource: String(formData.get("quoteSource")),
     quoteDate: latestPriceField?.dataset.quoteDate || existingAsset?.quoteDate || "",
     quoteFetchedAt: latestPriceField?.dataset.quoteFetchedAt || existingAsset?.quoteFetchedAt || "",
@@ -1991,6 +2068,12 @@ async function autoFillLatestPrice() {
     notes: document.querySelector("#asset-notes").value.trim(),
     updatedAt: new Date().toISOString()
   };
+  const inferredCurrency = getCurrencyForAssetSymbol(payload.symbol, payload.currency);
+  if (inferredCurrency !== payload.currency) {
+    await applyAssetCurrency(inferredCurrency);
+    payload.currency = inferredCurrency;
+    payload.fxRate = Number(document.querySelector("#asset-fx-rate").value) || 1;
+  }
 
   hintElement.classList.remove("hidden", "field-hint-error");
   hintElement.textContent = "正在自动获取最新单价...";
@@ -2007,9 +2090,15 @@ async function autoFillLatestPrice() {
     if (Number.isFinite(quote.previousClose)) {
       prevCloseField.value = String(quote.previousClose);
     }
+    if (quote.currency) {
+      await applyAssetCurrency(quote.currency);
+    }
+    if (Number.isFinite(quote.fxRate) && quote.fxRate > 0) {
+      document.querySelector("#asset-fx-rate").value = String(quote.fxRate);
+    }
     priceField.dataset.quoteDate = quote.quoteDate || "";
     priceField.dataset.quoteFetchedAt = quote.quoteFetchedAt || "";
-    hintElement.textContent = `已自动获取最新单价：${formatUnitPrice(quote.currentPrice, source, currency)}`;
+    hintElement.textContent = `已自动获取最新单价：${formatUnitPrice(quote.currentPrice, source, document.querySelector("#asset-currency").value || currency)}`;
   } catch (error) {
     hintElement.classList.add("field-hint-error");
     hintElement.textContent = error.message || "自动获取单价失败";
@@ -2203,6 +2292,11 @@ function normalizeAssetSymbol(symbol, type, platform) {
     return "";
   }
 
+  const hongKongSymbolMatch = cleaned.match(/^0*(\d{1,5})(?:\.HK)?$/);
+  if ((platform === "ibkr" || platform === "schwab") && hongKongSymbolMatch) {
+    return `${hongKongSymbolMatch[1].padStart(5, "0")}.HK`;
+  }
+
   if (cleaned.includes(".")) {
     return cleaned;
   }
@@ -2267,6 +2361,36 @@ function updateSymbolHint() {
   const type = document.querySelector("#asset-type").value;
   const platform = document.querySelector("#asset-platform").value;
   document.querySelector("#asset-symbol-hint").innerHTML = getSymbolHint(symbol, type, platform);
+}
+
+function getCurrencyForAssetSymbol(symbol, fallbackCurrency) {
+  const normalized = String(symbol || "").trim().toUpperCase();
+  if (normalized.endsWith(".HK")) {
+    return "HKD";
+  }
+  return fallbackCurrency || "CNY";
+}
+
+async function applyAssetCurrency(currency) {
+  const currencyField = document.querySelector("#asset-currency");
+  const fxField = document.querySelector("#asset-fx-rate");
+  currencyField.value = currency;
+  if (currency === "CNY") {
+    fxField.value = "1";
+    updatePriceUnitLabel();
+    return;
+  }
+  try {
+    const rates = await fetchCnyRates([currency]);
+    if (rates[currency]) {
+      fxField.value = String(rates[currency]);
+      state.displayFxRates[currency] = rates[currency];
+    }
+  } catch (error) {
+    console.error(error);
+    fxField.value = "1";
+  }
+  updatePriceUnitLabel();
 }
 
 async function applyRegionSelection(region) {
@@ -4136,8 +4260,8 @@ function renderHomepagePlatformProfit(assets) {
                 <small>${escapeHtml(row.dateText)}</small>
               </div>
             </div>
-            <div class="platform-profit-row__metrics ${row.isStaleOnly ? "platform-profit-row__metrics--stale" : ""}">
-              <strong class="${row.isStaleOnly ? "number-flat" : getToneClass(row.displayDailyProfit)}">${formatCurrency(row.displayDailyProfit)}</strong>
+            <div class="platform-profit-row__metrics ${row.isDisplayStale ? "platform-profit-row__metrics--stale" : ""}">
+              <strong class="${row.isDisplayStale ? "number-flat" : getToneClass(row.displayDailyProfit)}">${formatCurrency(row.displayDailyProfit)}</strong>
               <small>${formatSignedNumber(row.displayDailyRate)}%</small>
             </div>
           </div>
@@ -4155,8 +4279,8 @@ function renderHomepagePlatformProfit(assets) {
             <strong>${index + 1}. ${escapeHtml(getPlatformLabel(row.platform))}</strong>
             <small>${row.freshnessLabel} · ${escapeHtml(row.dateText)} · ${row.metricLabel} ${formatSignedNumber(row.displayDailyRate)}%</small>
           </div>
-          <div class="platform-profit-modal-item__values ${row.isStaleOnly ? "platform-profit-modal-item__values--stale" : ""}">
-            <strong class="${row.isStaleOnly ? "number-flat" : getToneClass(row.displayDailyProfit)}">${formatCurrency(row.displayDailyProfit)}</strong>
+          <div class="platform-profit-modal-item__values ${row.isDisplayStale ? "platform-profit-modal-item__values--stale" : ""}">
+            <strong class="${row.isDisplayStale ? "number-flat" : getToneClass(row.displayDailyProfit)}">${formatCurrency(row.displayDailyProfit)}</strong>
           </div>
         </article>
       `)
@@ -4215,14 +4339,10 @@ function buildHomepagePlatformProfitRows(assets) {
       const isUsPlatform = isUsEquityPlatform(row.platform);
       const usSession = isUsPlatform ? getUsMarketSessionInfo() : null;
       const shouldForceZero = Boolean(usSession?.zeroProfit);
-      const displayDailyProfit = shouldForceZero
-        ? 0
-        : (isStaleOnly ? row.displayDailyProfit : row.dailyProfit);
-      const displayDailyRate = shouldForceZero
-        ? 0
-        : (isStaleOnly
-          ? (row.displayCostValue > 0 ? (row.displayDailyProfit / row.displayCostValue) * 100 : 0)
-          : (row.costValue > 0 ? (row.dailyProfit / row.costValue) * 100 : 0));
+      const displayDailyProfit = (shouldForceZero || isStaleOnly) ? row.displayDailyProfit : row.dailyProfit;
+      const displayDailyRate = (shouldForceZero || isStaleOnly)
+        ? (row.displayCostValue > 0 ? (row.displayDailyProfit / row.displayCostValue) * 100 : 0)
+        : (row.costValue > 0 ? (row.dailyProfit / row.costValue) * 100 : 0);
       const freshnessLabel = isUsPlatform
         ? usSession.label
         : (row.hasTodayData ? (row.hasNonTodayData ? "部分更新" : "今日") : (row.hasCurrentData ? "最新" : "昨日"));
@@ -4230,13 +4350,14 @@ function buildHomepagePlatformProfitRows(assets) {
         ? usSession.badgeClass
         : (row.hasTodayData ? (row.hasNonTodayData ? "freshness-badge--mixed" : "freshness-badge--today") : (row.hasCurrentData ? "freshness-badge--today" : "freshness-badge--yesterday"));
       const metricLabel = shouldForceZero
-        ? "夜盘收益率"
+        ? "昨日收益率"
         : (isUsPlatform
           ? `${usSession.label}收益率`
           : (isStaleOnly ? "昨日收益率" : (row.hasTodayData ? "当日收益率" : "最新收益率")));
       return {
         ...row,
         isStaleOnly,
+        isDisplayStale: isStaleOnly || shouldForceZero,
         isUsPlatform,
         metricLabel,
         dailyProfit: effectiveDailyProfit,

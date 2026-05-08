@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import sleep, time
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 from zoneinfo import ZoneInfo
@@ -842,6 +843,8 @@ def refresh_assets_with_settings(
                 update={
                     "currentPrice": quote.get("currentPrice", asset.currentPrice),
                     "previousClose": quote.get("previousClose", asset.previousClose),
+                    "currency": quote.get("currency", asset.currency),
+                    "fxRate": quote.get("fxRate", asset.fxRate),
                     "symbol": quote.get("normalizedSymbol") or asset.symbol,
                     "quoteSource": quote.get("quoteSource") or asset.quoteSource,
                     "quoteDate": quote.get("quoteDate") if "quoteDate" in quote else "",
@@ -1463,6 +1466,62 @@ def normalize_cn_symbol(symbol: str, asset_type: str, platform: str) -> str:
     return f"{cleaned}.SZ"
 
 
+def normalize_finnhub_symbol(symbol: str, platform: str) -> str:
+    cleaned = symbol.strip().upper()
+    if not cleaned:
+        return ""
+    hong_kong_match = re.fullmatch(r"0*(\d{1,5})(?:\.HK)?", cleaned)
+    if str(platform or "").strip().lower() in {"ibkr", "schwab"} and hong_kong_match:
+        return f"{hong_kong_match.group(1).zfill(5)}.HK"
+    return cleaned
+
+
+def get_finnhub_symbol_currency(symbol: str, fallback_currency: str) -> str:
+    normalized = symbol.strip().upper()
+    if normalized.endswith(".HK"):
+        return "HKD"
+    return str(fallback_currency or "").strip().upper() or "USD"
+
+
+def fetch_eastmoney_hk_quote(symbol: str, asset: AssetPayload) -> dict[str, Any]:
+    normalized = normalize_finnhub_symbol(symbol, asset.platform)
+    match = re.fullmatch(r"0*(\d{1,5})\.HK", normalized)
+    if not match:
+        raise ValueError(f"Unsupported Hong Kong symbol: {symbol}")
+
+    code = match.group(1).zfill(5)
+    payload = read_eastmoney_json_url(
+        "https://push2delay.eastmoney.com/api/qt/stock/get?"
+        + urlencode(
+            {
+                "secid": f"116.{code}",
+                "invt": "2",
+                "fltt": "2",
+                "fields": "f43,f57,f58,f59,f60,f86,f124",
+            }
+        )
+    )
+    data = payload.get("data") or {}
+    if not data:
+        raise ValueError(f"Eastmoney HK quote missing data: {normalized}")
+
+    precision = data.get("f59", 3)
+    current_price = scale_eastmoney_hk_price(data.get("f43"), precision)
+    if current_price <= 0:
+        raise ValueError(f"Eastmoney HK quote missing current price: {normalized}")
+    previous_close = scale_eastmoney_hk_price(data.get("f60"), precision) or asset.previousClose or current_price
+    currency = "HKD"
+    return {
+        "currentPrice": current_price,
+        "previousClose": previous_close,
+        "currency": currency,
+        "fxRate": resolve_fx_rate_to_cny(currency, 0),
+        "normalizedSymbol": normalized,
+        "quoteSource": asset.quoteSource,
+        "quoteDate": to_quote_date(data.get("f86")),
+    }
+
+
 def normalize_eastmoney_secid(symbol: str) -> tuple[str, str]:
     normalized = symbol.strip().upper()
     if "." not in normalized:
@@ -1483,25 +1542,50 @@ def is_cn_exchange_traded_fund_symbol(symbol: str) -> bool:
     return code.startswith(("1", "5"))
 
 
+def is_cn_exchange_symbol(symbol: str) -> bool:
+    return re.fullmatch(r"\d{6}\.(SH|SZ)", symbol.strip().upper()) is not None
+
+
 def normalize_cn_etf_price_anomaly(
     current_price: float,
     previous_close: float,
     asset_previous_close: float,
+    asset_cost_price: float,
     symbol: str,
     asset_type: str,
 ) -> tuple[float, float]:
-    if asset_type != "fund" or not is_cn_exchange_traded_fund_symbol(symbol):
+    if not is_cn_exchange_symbol(symbol):
         return current_price, previous_close
 
-    reference_previous_close = float(asset_previous_close or 0)
-    if current_price < 10 or reference_previous_close <= 0:
+    reference_prices = [
+        float(asset_cost_price or 0),
+        float(asset_previous_close or 0),
+    ]
+    references = [price for price in reference_prices if price > 0]
+    if not references or current_price <= 0:
         return current_price, previous_close
 
-    ratio = current_price / reference_previous_close if reference_previous_close else 0
-    if 9.5 <= ratio <= 10.5:
-        normalized_current = current_price / 10
-        normalized_previous = previous_close / 10 if previous_close > 0 else previous_close
-        return normalized_current, normalized_previous
+    candidates = [
+        (current_price, previous_close, 1),
+        (current_price / 10, previous_close / 10 if previous_close > 0 else previous_close, 10),
+        (current_price * 10, previous_close * 10 if previous_close > 0 else previous_close, 0.1),
+    ]
+
+    def candidate_score(candidate_current_price: float) -> float:
+        ratios = [
+            max(candidate_current_price / reference_price, reference_price / candidate_current_price)
+            for reference_price in references
+            if candidate_current_price > 0 and reference_price > 0
+        ]
+        return min(ratios) if ratios else float("inf")
+
+    original_score = candidate_score(current_price)
+    best_current, best_previous, best_factor = min(candidates, key=lambda item: candidate_score(item[0]))
+
+    # Only fix obvious unit-scale errors: the adjusted price must be much closer
+    # to cost/last stored close, while the raw quote looks several times away.
+    if best_factor != 1 and original_score >= 4 and candidate_score(best_current) <= 2.5:
+        return best_current, best_previous
 
     return current_price, previous_close
 
@@ -1541,6 +1625,15 @@ def scale_eastmoney_price(value: Any, precision: Any) -> float:
     numeric = float(value or 0)
     digits = int(precision or 2)
     return numeric / (10 ** max(0, digits))
+
+
+def scale_eastmoney_hk_price(value: Any, precision: Any) -> float:
+    numeric = float(value or 0)
+    digits = int(precision or 3)
+    scale = 10 ** max(0, digits)
+    if numeric.is_integer() and abs(numeric) >= scale:
+        return numeric / scale
+    return numeric
 
 
 def fetch_eastmoney_realtime_quote(symbol: str) -> dict[str, Any]:
@@ -1590,20 +1683,34 @@ def read_series_date(record: Any, *candidates: str) -> str:
 
 
 def resolve_finnhub_quote(asset: AssetPayload, settings: sqlite3.Row) -> dict[str, Any]:
+    symbol = normalize_finnhub_symbol(asset.symbol, asset.platform)
+    if symbol.endswith(".HK"):
+        return fetch_eastmoney_hk_quote(symbol, asset)
+
     api_key = settings["finnhub_key"]
     if not api_key:
         raise HTTPException(status_code=400, detail="请先在设置里填写 Finnhub API Key")
 
-    symbol = asset.symbol.strip().upper()
     query = urlencode({"symbol": symbol, "token": api_key})
-    payload = read_json_url(f"https://finnhub.io/api/v1/quote?{query}")
+    try:
+        payload = read_json_url(f"https://finnhub.io/api/v1/quote?{query}")
+    except HTTPError as exc:
+        if exc.code in {401, 403}:
+            raise HTTPException(status_code=exc.code, detail="Finnhub API Key invalid, unauthorized, or not permitted for this quote. Update it in settings.") from exc
+        raise
+    if payload.get("error"):
+        raise HTTPException(status_code=502, detail=f"Finnhub error: {str(payload.get('error'))[:120]}")
     current_price = float(payload.get("c", 0) or 0)
     if current_price <= 0:
         raise HTTPException(status_code=502, detail="Finnhub 未返回有效报价")
 
+    currency = get_finnhub_symbol_currency(symbol, asset.currency)
+    fx_rate = resolve_fx_rate_to_cny(currency, 0 if currency == "HKD" else asset.fxRate)
     return {
         "currentPrice": current_price,
         "previousClose": float(payload.get("pc", asset.previousClose) or asset.previousClose),
+        "currency": currency,
+        "fxRate": fx_rate,
         "normalizedSymbol": symbol,
         "quoteSource": "finnhub",
         "quoteDate": to_quote_date(payload.get("t")),
@@ -2826,6 +2933,7 @@ def resolve_tushare_realtime_quote(asset: AssetPayload, settings: sqlite3.Row) -
         current_price,
         previous_close,
         asset.previousClose,
+        asset.costPrice,
         ts_code,
         asset.type,
     )

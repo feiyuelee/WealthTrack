@@ -165,8 +165,8 @@
       <section class="view-panel" data-view="entry">
         <section class="panel">
           <div class="entry-action-tabs" role="tablist" aria-label="录入动作">
-            <button type="button" class="entry-action-tabs__button is-active" data-entry-mode="asset">新增资产</button>
-            <button type="button" class="entry-action-tabs__button" data-entry-mode="trade">买卖资产</button>
+            <button type="button" class="entry-action-tabs__button is-active" data-entry-mode="asset">建仓</button>
+            <button type="button" class="entry-action-tabs__button" data-entry-mode="trade">仓位调整</button>
             <button type="button" class="entry-action-tabs__button" data-entry-mode="cash">平台出入金</button>
           </div>
         </section>
@@ -174,8 +174,8 @@
         <section class="panel" data-entry-workspace="asset">
           <div class="panel-header">
             <div>
-              <p class="section-tag">录入</p>
-              <h2>新增或编辑资产</h2>
+              <p class="section-tag">建仓</p>
+              <h2>新建或编辑仓位</h2>
             </div>
             <button id="reset-form-btn" class="ghost-button">清空表单</button>
           </div>
@@ -267,7 +267,7 @@
             <input id="asset-notes" name="notes" type="hidden" value="">
 
             <div class="form-actions">
-              <button type="submit" class="primary-button">保存资产</button>
+              <button type="submit" class="primary-button">保存仓位</button>
             </div>
           </form>
         </section>
@@ -275,8 +275,8 @@
         <section class="panel" data-entry-workspace="transaction">
           <div class="panel-header">
             <div>
-              <p class="section-tag">交易</p>
-              <h2>买卖与资金流水</h2>
+              <p class="section-tag">调仓</p>
+              <h2>仓位调整与资金流水</h2>
             </div>
           </div>
           <form id="transaction-form" class="asset-form transaction-form" novalidate>
@@ -286,7 +286,7 @@
                 <select id="transaction-trade-platform"></select>
               </label>
               <label class="transaction-form__asset-field">
-                <span>已有资产</span>
+                  <span>调整资产</span>
                 <select id="transaction-asset-id"></select>
               </label>
             </div>
@@ -294,10 +294,11 @@
             <div class="form-row transaction-form__top-row">
               <div class="transaction-form__stack">
                 <label>
-                  <span>交易类型</span>
+                  <span>调整类型</span>
                   <select id="transaction-kind">
-                    <option value="buy">买入</option>
-                    <option value="sell">卖出</option>
+                    <option value="buy">加仓</option>
+                    <option value="sell">减仓</option>
+                    <option value="close">清仓</option>
                     <option value="deposit">入金</option>
                     <option value="withdraw">出金</option>
                   </select>
@@ -340,7 +341,7 @@
             </div>
 
             <div class="form-actions">
-              <button type="submit" class="primary-button" id="submit-transaction-form-btn">记录交易</button>
+              <button type="submit" class="primary-button" id="submit-transaction-form-btn">记录调仓</button>
               <button type="button" class="ghost-button" id="reset-transaction-form-btn">重置</button>
             </div>
           </form>
