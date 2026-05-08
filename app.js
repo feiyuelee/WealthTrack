@@ -1067,6 +1067,7 @@ function formatQuantityForAsset(quantity, asset) {
 function syncTransactionQuantityConstraints() {
   const kind = String(document.querySelector("#transaction-kind")?.value || "").trim();
   const quantityField = document.querySelector("#transaction-quantity");
+  const quantityHint = document.querySelector("#transaction-current-quantity-hint");
   const selectedAsset = getSelectedTransactionAsset();
   if (!quantityField) {
     return;
@@ -1076,6 +1077,11 @@ function syncTransactionQuantityConstraints() {
   quantityField.removeAttribute("max");
   quantityField.step = isWholeUnitAsset(selectedAsset) ? "1" : "0.000001";
   quantityField.placeholder = "0";
+  if (quantityHint) {
+    quantityHint.textContent = selectedAsset
+      ? `当前持仓：${formatQuantityForAsset(selectedAsset.quantity, selectedAsset)}`
+      : "";
+  }
 
   if ((kind === "sell" || kind === "close") && selectedAsset) {
     const currentQuantity = normalizeTransactionQuantityForAsset(selectedAsset.quantity, selectedAsset);
