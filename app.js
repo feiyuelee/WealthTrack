@@ -11,10 +11,12 @@ const state = {
   assets: [],
   accountBalances: [],
   transactions: [],
+  tradePlans: [],
   entryMode: "asset",
   transactionMode: "trade",
   editingTransactionId: "",
   editingTransactionAsset: null,
+  activeTradePlanId: "",
   weeklySummary: createEmptyWeeklySummary(),
   growthSummary: null,
   growthRangeDays: 7,
@@ -477,6 +479,14 @@ function bindEvents() {
   if (resetTransactionButton) {
     resetTransactionButton.addEventListener("click", resetTransactionForm);
   }
+  const saveTradePlanButton = document.querySelector("#save-trade-plan-btn");
+  if (saveTradePlanButton) {
+    saveTradePlanButton.addEventListener("click", handleTradePlanSave);
+  }
+  const saveAssetPlanButton = document.querySelector("#save-asset-plan-btn");
+  if (saveAssetPlanButton) {
+    saveAssetPlanButton.addEventListener("click", handleAssetPlanSave);
+  }
   document.querySelectorAll("[data-entry-mode]").forEach((button) => {
     button.addEventListener("click", handleEntryModeChange);
   });
@@ -593,17 +603,19 @@ async function bootstrapSession() {
 }
 
 async function loadServerData() {
-  const [assetsResponse, settingsResponse, accountBalancesResponse, transactionsResponse] = await Promise.all([
+  const [assetsResponse, settingsResponse, accountBalancesResponse, transactionsResponse, tradePlansResponse] = await Promise.all([
     apiFetch("/api/assets"),
     apiFetch("/api/settings"),
     apiFetch("/api/account-balances"),
-    apiFetch("/api/transactions")
+    apiFetch("/api/transactions"),
+    apiFetch("/api/trade-plans")
   ]);
 
   state.assets = assetsResponse.assets;
   state.settings = settingsResponse.settings;
   state.accountBalances = accountBalancesResponse.accountBalances || [];
   state.transactions = transactionsResponse.transactions || [];
+  state.tradePlans = tradePlansResponse.tradePlans || [];
   state.weeklySummary = createEmptyWeeklySummary();
   state.accountOverviewCurrency = inferAccountOverviewCurrency();
   hydrateSettings();
@@ -642,6 +654,7 @@ async function refreshPortfolioState(options = {}) {
     state.assets = [];
     state.accountBalances = [];
     state.transactions = [];
+    state.tradePlans = [];
     state.weeklySummary = createEmptyWeeklySummary();
     if (renderAfter) {
       render();
@@ -649,15 +662,17 @@ async function refreshPortfolioState(options = {}) {
     return;
   }
 
-  const [assetsResponse, accountBalancesResponse, transactionsResponse] = await Promise.all([
+  const [assetsResponse, accountBalancesResponse, transactionsResponse, tradePlansResponse] = await Promise.all([
     apiFetch("/api/assets"),
     apiFetch("/api/account-balances"),
-    apiFetch("/api/transactions")
+    apiFetch("/api/transactions"),
+    apiFetch("/api/trade-plans")
   ]);
 
   state.assets = assetsResponse.assets || [];
   state.accountBalances = accountBalancesResponse.accountBalances || [];
   state.transactions = transactionsResponse.transactions || [];
+  state.tradePlans = tradePlansResponse.tradePlans || [];
   state.accountOverviewCurrency = inferAccountOverviewCurrency();
   await refreshWeeklySummary({ renderAfter: false });
   await refreshGrowthSummary({ renderAfter: false });
@@ -674,7 +689,11 @@ function syncEntryWorkspace() {
   });
   document.querySelectorAll("[data-entry-workspace]").forEach((panel) => {
     const workspace = panel.dataset.entryWorkspace;
-    const shouldShow = state.entryMode === "asset" ? workspace === "asset" : workspace === "transaction";
+    const shouldShow = state.entryMode === "asset"
+      ? workspace === "asset"
+      : state.entryMode === "trade"
+        ? workspace === "transaction" || workspace === "trade-plan"
+        : workspace === "transaction";
     panel.classList.toggle("hidden", !shouldShow);
   });
 }
@@ -702,6 +721,7 @@ function render() {
   renderSummary(filteredAssets);
   renderWeeklySummary();
   renderGrowthSummary();
+  renderTradePlans();
   renderTransactionHistory();
   renderHomepageAssetDistribution(filteredAssets);
   renderHomepagePlatformProfit(filteredAssets);
@@ -1161,6 +1181,7 @@ function resetTransactionForm() {
   form.reset();
   state.editingTransactionId = "";
   state.editingTransactionAsset = null;
+  state.activeTradePlanId = "";
   state.transactionMode = state.entryMode === "cash" ? "cash" : "trade";
   const platformField = document.querySelector("#transaction-platform");
   const tradePlatformField = document.querySelector("#transaction-trade-platform");
@@ -1171,6 +1192,333 @@ function resetTransactionForm() {
     tradePlatformField.value = "ibkr";
   }
   syncTransactionFormByKind();
+}
+
+function buildTradePlanFromAsset(asset, planId = "") {
+  return {
+    id: planId || createClientId(),
+    kind: "asset",
+    platform: asset.platform,
+    assetName: asset.name,
+    assetType: asset.type,
+    symbol: asset.symbol,
+    quantity: asset.quantity,
+    price: asset.costPrice,
+    fee: 0,
+    currency: asset.currency,
+    fxRate: asset.fxRate,
+    quoteSource: asset.quoteSource,
+    quoteDate: asset.quoteDate,
+    notes: asset.notes || "",
+    plannedAt: new Date().toISOString()
+  };
+}
+
+async function buildAssetPayloadFromForm(options = {}) {
+  const { preserveId = true } = options;
+  await applyRegionSelection(document.querySelector("#asset-region").value);
+
+  const formData = new FormData(form);
+  const rawSymbol = String(formData.get("symbol")).trim().toUpperCase();
+  const normalizedSymbol = normalizeAssetSymbol(rawSymbol, String(formData.get("type")), String(formData.get("platform")));
+  const inferredCurrency = getCurrencyForAssetSymbol(normalizedSymbol, String(formData.get("currency")));
+  if (inferredCurrency !== String(formData.get("currency"))) {
+    await applyAssetCurrency(inferredCurrency);
+  }
+  const existingAsset = state.assets.find((item) => item.id === formData.get("id"));
+  const latestPriceField = document.querySelector("#asset-price");
+  const asset = {
+    id: preserveId ? (formData.get("id") || createClientId()) : createClientId(),
+    name: String(formData.get("name")).trim(),
+    platform: String(formData.get("platform")),
+    type: String(formData.get("type")),
+    symbol: normalizedSymbol,
+    quantity: Number(formData.get("quantity")),
+    costPrice: Number(formData.get("costPrice")),
+    currentPrice: Number(formData.get("currentPrice")) || 0,
+    previousClose: Number(formData.get("previousClose")) || 0,
+    currency: document.querySelector("#asset-currency").value,
+    fxRate: Number(document.querySelector("#asset-fx-rate").value) || 1,
+    quoteSource: String(formData.get("quoteSource")),
+    quoteDate: latestPriceField?.dataset.quoteDate || existingAsset?.quoteDate || "",
+    quoteFetchedAt: latestPriceField?.dataset.quoteFetchedAt || existingAsset?.quoteFetchedAt || "",
+    notes: String(formData.get("notes")).trim(),
+    updatedAt: new Date().toISOString()
+  };
+
+  if (!asset.name || !asset.symbol || asset.quantity <= 0 || asset.costPrice < 0 || asset.fxRate <= 0) {
+    throw new Error("请把名称、代码、数量、成本和汇率填写完整");
+  }
+
+  const compatibilityError = getSymbolCompatibilityError(asset.symbol, asset.quoteSource, asset.type, asset.platform);
+  if (compatibilityError) {
+    validateAssetSymbolCompatibility();
+    throw new Error(compatibilityError);
+  }
+
+  return asset;
+}
+
+async function handleAssetPlanSave(event) {
+  event?.preventDefault?.();
+  if (!ensureLoggedIn()) {
+    return;
+  }
+  try {
+    const asset = await buildAssetPayloadFromForm({ preserveId: false });
+    const planId = state.activeTradePlanId || createClientId();
+    const planPayload = buildTradePlanFromAsset(asset, planId);
+    await apiFetch(state.activeTradePlanId ? `/api/trade-plans/${encodeURIComponent(state.activeTradePlanId)}` : "/api/trade-plans", {
+      method: state.activeTradePlanId ? "PUT" : "POST",
+      body: JSON.stringify(planPayload)
+    });
+    const tradePlansResponse = await apiFetch("/api/trade-plans");
+    state.tradePlans = tradePlansResponse.tradePlans || [];
+    state.activeTradePlanId = "";
+    render();
+    showToast("建仓计划已保存，不会影响资产统计");
+  } catch (error) {
+    showToast(error.message || "保存建仓计划失败");
+  }
+}
+
+async function buildTransactionPayload(options = {}) {
+  const { id = "", allowEmptyPrice = false, skipFxRefresh = false } = options;
+  const rawKind = String(document.querySelector("#transaction-kind")?.value || "").trim();
+  const kind = rawKind === "close" ? "sell" : rawKind;
+  const rawPlatform = String(document.querySelector("#transaction-platform")?.value || "").trim();
+  const rawTradePlatform = String(document.querySelector("#transaction-trade-platform")?.value || "").trim();
+  const selectedAsset = getSelectedTransactionAsset();
+  const platform = (kind === "buy" || kind === "sell")
+    ? String(selectedAsset?.platform || rawTradePlatform || rawPlatform).trim()
+    : rawPlatform;
+  const currency = String(selectedAsset?.currency || getPlatformCurrency(platform)).trim().toUpperCase();
+  if (currency !== "CNY" && !skipFxRefresh) {
+    await ensureFxRateCached(currency);
+  }
+  const payload = {
+    id: id || state.editingTransactionId || createClientId(),
+    kind,
+    platform,
+    assetName: selectedAsset?.name || "",
+    assetType: selectedAsset?.type || "",
+    symbol: selectedAsset?.symbol || "",
+    quantity: normalizeTransactionQuantityForAsset(Number(document.querySelector("#transaction-quantity")?.value) || 0, selectedAsset),
+    price: Number(document.querySelector("#transaction-price")?.value) || 0,
+    fee: Number(document.querySelector("#transaction-fee")?.value) || 0,
+    cashAmount: Number(document.querySelector("#transaction-cash-amount")?.value) || 0,
+    currency,
+    fxRate: getCurrencyFxRateToCny(currency),
+    quoteSource: selectedAsset?.quoteSource || "manual",
+    quoteDate: selectedAsset?.quoteDate || "",
+    notes: rawKind === "close" ? "close" : "",
+    occurredAt: new Date().toISOString()
+  };
+
+  if (!payload.kind || !payload.platform) {
+    throw new Error("请先选择调整类型和平台");
+  }
+  if (payload.kind === "buy" || payload.kind === "sell") {
+    if (!selectedAsset) {
+      throw new Error("请先选择要调整的仓位");
+    }
+    if (payload.quantity <= 0) {
+      throw new Error("请填写正确的调整数量");
+    }
+    if (rawKind === "close") {
+      payload.quantity = normalizeTransactionQuantityForAsset(selectedAsset.quantity, selectedAsset);
+      const quantityField = document.querySelector("#transaction-quantity");
+      if (quantityField) {
+        quantityField.value = payload.quantity ? formatQuantityForAsset(payload.quantity, selectedAsset) : "";
+      }
+    }
+    const currentQuantity = normalizeTransactionQuantityForAsset(selectedAsset.quantity, selectedAsset);
+    if (payload.kind === "sell" && payload.quantity > currentQuantity + 1e-9) {
+      throw new Error("减仓数量不能大于当前持仓数量");
+    }
+    if (isWholeUnitAsset(selectedAsset)) {
+      const quantityField = document.querySelector("#transaction-quantity");
+      if (quantityField) {
+        quantityField.value = payload.quantity ? String(payload.quantity) : "";
+      }
+    }
+    if (!allowEmptyPrice && payload.price <= 0) {
+      throw new Error("请填写正确的成交价");
+    }
+  }
+  if ((payload.kind === "deposit" || payload.kind === "withdraw") && payload.cashAmount <= 0) {
+    throw new Error("入金或出金金额必须大于 0");
+  }
+  return payload;
+}
+
+async function handleTradePlanSave(event) {
+  event?.preventDefault?.();
+  if (!ensureLoggedIn()) {
+    return;
+  }
+  if (state.transactionMode === "cash") {
+    showToast("交易计划只用于加仓、减仓和清仓");
+    return;
+  }
+  try {
+    const planId = state.activeTradePlanId || createClientId();
+    const payload = await buildTransactionPayload({ id: planId, allowEmptyPrice: true, skipFxRefresh: true });
+    const planPayload = {
+      ...payload,
+      plannedAt: new Date().toISOString()
+    };
+    delete planPayload.cashAmount;
+    delete planPayload.occurredAt;
+    await apiFetch(state.activeTradePlanId ? `/api/trade-plans/${encodeURIComponent(state.activeTradePlanId)}` : "/api/trade-plans", {
+      method: state.activeTradePlanId ? "PUT" : "POST",
+      body: JSON.stringify(planPayload)
+    });
+    const tradePlansResponse = await apiFetch("/api/trade-plans");
+    state.tradePlans = tradePlansResponse.tradePlans || [];
+    state.activeTradePlanId = "";
+    render();
+    showToast("交易计划已保存，不会影响资产统计");
+  } catch (error) {
+    showToast(error.message || "保存交易计划失败");
+  }
+}
+
+function fillTransactionFormFromPlan(plan) {
+  if (plan.kind === "asset") {
+    state.activeTradePlanId = plan.id;
+    state.entryMode = "asset";
+    fillForm({
+      id: "",
+      name: plan.assetName || plan.symbol,
+      platform: plan.platform,
+      type: plan.assetType,
+      symbol: plan.symbol,
+      quantity: plan.quantity,
+      costPrice: plan.price,
+      currentPrice: Number(plan.price) || 0,
+      previousClose: 0,
+      currency: plan.currency || getPlatformCurrency(plan.platform),
+      fxRate: plan.fxRate || getCurrencyFxRateToCny(plan.currency),
+      quoteSource: plan.quoteSource || "manual",
+      quoteDate: plan.quoteDate || "",
+      quoteFetchedAt: "",
+      notes: plan.notes || ""
+    });
+    syncEntryWorkspace();
+    return;
+  }
+
+  state.editingTransactionId = "";
+  state.editingTransactionAsset = null;
+  state.activeTradePlanId = plan.id;
+  state.entryMode = "trade";
+  state.transactionMode = "trade";
+  syncEntryWorkspace();
+  syncTransactionFormByKind();
+
+  const kindField = document.querySelector("#transaction-kind");
+  const tradePlatformField = document.querySelector("#transaction-trade-platform");
+  const assetField = document.querySelector("#transaction-asset-id");
+  const quantityField = document.querySelector("#transaction-quantity");
+  const priceField = document.querySelector("#transaction-price");
+  const feeField = document.querySelector("#transaction-fee");
+  const matchedAsset = state.assets.find((item) => item.platform === plan.platform && item.type === plan.assetType && item.symbol === plan.symbol);
+
+  if (tradePlatformField) {
+    tradePlatformField.value = plan.platform || tradePlatformField.value;
+  }
+  syncTransactionFormByKind();
+  if (kindField) {
+    kindField.value = plan.kind === "sell" && plan.notes === "close" ? "close" : plan.kind;
+  }
+  if (assetField && matchedAsset) {
+    assetField.value = matchedAsset.id;
+  }
+  if (quantityField) {
+    quantityField.value = plan.quantity || "";
+  }
+  if (priceField) {
+    priceField.value = Number(plan.price) > 0 ? plan.price : "";
+  }
+  if (feeField) {
+    feeField.value = plan.fee || 0;
+  }
+  syncTransactionAssetSelection();
+  syncTransactionQuantityConstraints();
+}
+
+async function handleTradePlanAction(event) {
+  const action = event.currentTarget.dataset.planAction;
+  const id = event.currentTarget.dataset.id;
+  const plan = state.tradePlans.find((item) => item.id === id);
+  if (!plan) {
+    return;
+  }
+  if (action === "edit") {
+    fillTransactionFormFromPlan(plan);
+    switchView("entry");
+    window.scrollTo({ top: 0, behavior: "smooth" });
+    showToast("计划已载入，补成交价后可记录为真实调仓");
+    return;
+  }
+  const label = plan.assetName || plan.symbol;
+  if (!window.confirm(`确定删除这条交易计划吗？\n${label}`)) {
+    return;
+  }
+  await apiFetch(`/api/trade-plans/${encodeURIComponent(plan.id)}`, { method: "DELETE" });
+  state.tradePlans = state.tradePlans.filter((item) => item.id !== plan.id);
+  if (state.activeTradePlanId === plan.id) {
+    state.activeTradePlanId = "";
+  }
+  render();
+  showToast("交易计划已删除");
+}
+
+function renderTradePlans() {
+  const container = document.querySelector("#trade-plan-list");
+  if (!container) {
+    return;
+  }
+  const plans = state.tradePlans || [];
+  if (!plans.length) {
+    container.innerHTML = '<p class="transaction-history__empty">还没有交易计划。保存计划后，它不会影响资产统计。</p>';
+    return;
+  }
+  container.innerHTML = plans
+    .slice(0, 20)
+    .map((plan) => {
+      const actionLabel = plan.kind === "asset"
+        ? "计划建仓"
+        : plan.kind === "buy"
+          ? "计划加仓"
+          : (plan.notes === "close" ? "计划清仓" : "计划减仓");
+      const title = `${actionLabel} ${plan.assetName || plan.symbol}`;
+      const meta = [getPlatformLabel(plan.platform), plan.symbol, plan.plannedAt ? new Date(plan.plannedAt).toLocaleString("zh-CN") : ""]
+        .filter(Boolean)
+        .join(" · ");
+      const priceLabel = Number(plan.price) > 0 ? `计划价 ${formatNumber(plan.price)}` : "待填成交价";
+      return `
+        <article class="transaction-item transaction-item--plan">
+          <div>
+            <strong>${escapeHtml(title)}</strong>
+            <small>${escapeHtml(meta)}</small>
+          </div>
+          <div class="transaction-item__values">
+            <strong>${escapeHtml(formatQuantityForAsset(plan.quantity, { type: plan.assetType }))}</strong>
+            <small>${escapeHtml(priceLabel)}</small>
+          </div>
+          <div class="transaction-item__actions">
+            <button type="button" class="ghost-button" data-plan-action="edit" data-id="${escapeHtml(plan.id)}">编辑</button>
+            <button type="button" class="ghost-button danger-ghost-button" data-plan-action="delete" data-id="${escapeHtml(plan.id)}">删除</button>
+          </div>
+        </article>
+      `;
+    })
+    .join("");
+  container.querySelectorAll("[data-plan-action]").forEach((button) => {
+    button.addEventListener("click", handleTradePlanAction);
+  });
 }
 
 async function handleRecordAction(event) {
@@ -1311,93 +1659,21 @@ async function handleTransactionSubmit(event) {
     return;
   }
 
-  const rawKind = String(document.querySelector("#transaction-kind")?.value || "").trim();
-  const kind = rawKind === "close" ? "sell" : rawKind;
-  const rawPlatform = String(document.querySelector("#transaction-platform")?.value || "").trim();
-  const rawTradePlatform = String(document.querySelector("#transaction-trade-platform")?.value || "").trim();
-  const selectedAsset = getSelectedTransactionAsset();
-  const platform = (kind === "buy" || kind === "sell")
-    ? String(selectedAsset?.platform || rawTradePlatform || rawPlatform).trim()
-    : rawPlatform;
-  const currency = String(selectedAsset?.currency || getPlatformCurrency(platform)).trim().toUpperCase();
-  if (currency !== "CNY") {
-    try {
-      await ensureFxRateCached(currency);
-    } catch (error) {
-      showToast(error.message || "获取汇率失败");
-      return;
-    }
-  }
-  const payload = {
-    id: state.editingTransactionId || createClientId(),
-    kind,
-    platform,
-    assetName: selectedAsset?.name || "",
-    assetType: selectedAsset?.type || "",
-    symbol: selectedAsset?.symbol || "",
-    quantity: normalizeTransactionQuantityForAsset(Number(document.querySelector("#transaction-quantity")?.value) || 0, selectedAsset),
-    price: Number(document.querySelector("#transaction-price")?.value) || 0,
-    fee: Number(document.querySelector("#transaction-fee")?.value) || 0,
-    cashAmount: Number(document.querySelector("#transaction-cash-amount")?.value) || 0,
-    currency,
-    fxRate: getCurrencyFxRateToCny(currency),
-    quoteSource: selectedAsset?.quoteSource || "manual",
-    quoteDate: selectedAsset?.quoteDate || "",
-    notes: rawKind === "close" ? "close" : "",
-    occurredAt: new Date().toISOString()
-  };
-
-  if (!payload.kind || !payload.platform) {
-    showToast("请先选择调整类型和平台");
-    return;
-  }
-  if (payload.kind === "buy" || payload.kind === "sell") {
-    if (!selectedAsset) {
-      showToast("请先选择要调整的仓位");
-      return;
-    }
-    if (payload.quantity <= 0) {
-      showToast("请填写正确的调整数量");
-      return;
-    }
-    if (rawKind === "close") {
-      payload.quantity = normalizeTransactionQuantityForAsset(selectedAsset.quantity, selectedAsset);
-      const quantityField = document.querySelector("#transaction-quantity");
-      if (quantityField) {
-        quantityField.value = payload.quantity ? formatQuantityForAsset(payload.quantity, selectedAsset) : "";
-      }
-    }
-    const currentQuantity = normalizeTransactionQuantityForAsset(selectedAsset.quantity, selectedAsset);
-    if (payload.kind === "sell" && payload.quantity > currentQuantity + 1e-9) {
-      showToast("减仓数量不能大于当前持仓数量");
-      return;
-    }
-    if (isWholeUnitAsset(selectedAsset)) {
-      const quantityField = document.querySelector("#transaction-quantity");
-      if (quantityField) {
-        quantityField.value = payload.quantity ? String(payload.quantity) : "";
-      }
-    }
-    if (payload.price <= 0) {
-      showToast("请填写正确的成交价");
-      return;
-    }
-  }
-  if ((payload.kind === "deposit" || payload.kind === "withdraw") && payload.cashAmount <= 0) {
-    showToast("入金或出金金额必须大于 0");
-    return;
-  }
-
   const isEditingTransaction = Boolean(state.editingTransactionId);
+  const activePlanId = state.activeTradePlanId;
   try {
+    const payload = await buildTransactionPayload();
     await apiFetch(isEditingTransaction ? `/api/transactions/${encodeURIComponent(state.editingTransactionId)}` : "/api/transactions", {
       method: isEditingTransaction ? "PUT" : "POST",
       body: JSON.stringify(payload)
     });
+    if (activePlanId && !isEditingTransaction) {
+      await apiFetch(`/api/trade-plans/${encodeURIComponent(activePlanId)}`, { method: "DELETE" });
+    }
     await refreshPortfolioState({ renderAfter: false });
     resetTransactionForm();
     render();
-    showToast(isEditingTransaction ? "记录已更新" : (payload.kind === "buy" || payload.kind === "sell" ? "调仓已记录并同步持仓" : "资金流水已记录"));
+    showToast(activePlanId ? "计划已执行并同步持仓" : (isEditingTransaction ? "记录已更新" : (payload.kind === "buy" || payload.kind === "sell" ? "调仓已记录并同步持仓" : "资金流水已记录")));
   } catch (error) {
     showToast(error.message || "记录调仓失败");
   }
@@ -1545,56 +1821,23 @@ async function handleSubmit(event) {
     return;
   }
 
-  await applyRegionSelection(document.querySelector("#asset-region").value);
-
-  const formData = new FormData(form);
-  const rawSymbol = String(formData.get("symbol")).trim().toUpperCase();
-  const normalizedSymbol = normalizeAssetSymbol(rawSymbol, String(formData.get("type")), String(formData.get("platform")));
-  const inferredCurrency = getCurrencyForAssetSymbol(normalizedSymbol, String(formData.get("currency")));
-  if (inferredCurrency !== String(formData.get("currency"))) {
-    await applyAssetCurrency(inferredCurrency);
+  const activePlanId = state.activeTradePlanId;
+  try {
+    const asset = await buildAssetPayloadFromForm();
+    const saved = await apiFetch("/api/assets", {
+      method: "POST",
+      body: JSON.stringify(asset)
+    });
+    if (activePlanId) {
+      await apiFetch(`/api/trade-plans/${encodeURIComponent(activePlanId)}`, { method: "DELETE" });
+    }
+    await refreshPortfolioState({ renderAfter: false });
+    resetForm();
+    render();
+    showToast(activePlanId ? "建仓计划已执行并保存仓位" : (saved.asset ? "资产记录已保存" : "资产已保存"));
+  } catch (error) {
+    showToast(error.message || "资产保存失败");
   }
-  const existingAsset = state.assets.find((item) => item.id === formData.get("id"));
-  const latestPriceField = document.querySelector("#asset-price");
-  const asset = {
-    id: formData.get("id") || createClientId(),
-    name: String(formData.get("name")).trim(),
-    platform: String(formData.get("platform")),
-    type: String(formData.get("type")),
-    symbol: normalizedSymbol,
-    quantity: Number(formData.get("quantity")),
-    costPrice: Number(formData.get("costPrice")),
-    currentPrice: Number(formData.get("currentPrice")) || 0,
-    previousClose: Number(formData.get("previousClose")) || 0,
-    currency: document.querySelector("#asset-currency").value,
-    fxRate: Number(document.querySelector("#asset-fx-rate").value) || 1,
-    quoteSource: String(formData.get("quoteSource")),
-    quoteDate: latestPriceField?.dataset.quoteDate || existingAsset?.quoteDate || "",
-    quoteFetchedAt: latestPriceField?.dataset.quoteFetchedAt || existingAsset?.quoteFetchedAt || "",
-    notes: String(formData.get("notes")).trim(),
-    updatedAt: new Date().toISOString()
-  };
-
-  if (!asset.name || !asset.symbol || asset.quantity <= 0 || asset.costPrice < 0 || asset.fxRate <= 0) {
-    showToast("请把名称、代码、数量、成本和汇率填写完整");
-    return;
-  }
-
-  const compatibilityError = getSymbolCompatibilityError(asset.symbol, asset.quoteSource, asset.type, asset.platform);
-  if (compatibilityError) {
-    showToast(compatibilityError);
-    validateAssetSymbolCompatibility();
-    return;
-  }
-
-  const saved = await apiFetch("/api/assets", {
-    method: "POST",
-    body: JSON.stringify(asset)
-  });
-  await refreshPortfolioState({ renderAfter: false });
-  resetForm();
-  render();
-  showToast(saved.asset ? "资产记录已保存" : "资产已保存");
 }
 
 async function handleAuthSubmit(event) {
@@ -1642,6 +1885,7 @@ async function logout() {
   state.assets = [];
   state.accountBalances = [];
   state.transactions = [];
+  state.tradePlans = [];
   state.weeklySummary = createEmptyWeeklySummary();
   state.accountOverviewCurrency = "CNY";
     state.settings = {
@@ -1668,6 +1912,7 @@ async function handleAssetAction(event) {
   }
 
   if (action === "edit") {
+    state.activeTradePlanId = "";
     state.entryMode = "asset";
     fillForm(asset);
     switchView("entry");
@@ -1692,7 +1937,7 @@ async function clearAssets() {
   if (!ensureLoggedIn()) {
     return;
   }
-  if (!state.assets.length && !state.transactions.length && !state.accountBalances.length) {
+  if (!state.assets.length && !state.transactions.length && !state.accountBalances.length && !state.tradePlans.length) {
     showToast("当前没有可清理的数据");
     return;
   }
@@ -1703,6 +1948,7 @@ async function clearAssets() {
   state.assets = [];
   state.transactions = [];
   state.accountBalances = [];
+  state.tradePlans = [];
   state.weeklySummary = createEmptyWeeklySummary();
   render();
   showToast("全部记录已清空");
@@ -1760,6 +2006,7 @@ async function handleImportAssets(event) {
       state.assets = [];
       state.transactions = [];
       state.accountBalances = [];
+      state.tradePlans = [];
     }
 
     let importedCount = 0;
@@ -2143,6 +2390,7 @@ function resetForm() {
   document.querySelector("#asset-source-select").value = "fund_eastmoney";
   document.querySelector("#asset-type").value = "fund";
   document.querySelector("#asset-region").value = "domestic";
+  state.activeTradePlanId = "";
   state.regionTouched = false;
   syncFormByContext();
   updateSymbolHint();

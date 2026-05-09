@@ -277,6 +277,16 @@ def ensure_transaction_columns(conn: sqlite3.Connection) -> None:
         conn.commit()
 
 
+def ensure_trade_plan_columns(conn: sqlite3.Connection) -> None:
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(trade_plans)").fetchall()}
+    if "fee" not in columns:
+        conn.execute("ALTER TABLE trade_plans ADD COLUMN fee REAL NOT NULL DEFAULT 0")
+        conn.commit()
+    if "notes" not in columns:
+        conn.execute("ALTER TABLE trade_plans ADD COLUMN notes TEXT NOT NULL DEFAULT ''")
+        conn.commit()
+
+
 def ensure_admin_user(conn: sqlite3.Connection) -> None:
     username = ADMIN_USERNAME
     salt = secrets.token_hex(16)
@@ -398,12 +408,35 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS trade_plans (
+                id TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                asset_name TEXT NOT NULL DEFAULT '',
+                asset_type TEXT NOT NULL DEFAULT '',
+                symbol TEXT NOT NULL DEFAULT '',
+                quantity REAL NOT NULL DEFAULT 0,
+                price REAL NOT NULL DEFAULT 0,
+                fee REAL NOT NULL DEFAULT 0,
+                currency TEXT NOT NULL DEFAULT '',
+                fx_rate REAL NOT NULL DEFAULT 1,
+                quote_source TEXT NOT NULL DEFAULT 'manual',
+                quote_date TEXT NOT NULL DEFAULT '',
+                notes TEXT NOT NULL DEFAULT '',
+                planned_at TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
             """
         )
         ensure_user_settings_columns(conn)
         ensure_account_balance_columns(conn)
         ensure_asset_columns(conn)
         ensure_transaction_columns(conn)
+        ensure_trade_plan_columns(conn)
         ensure_admin_user(conn)
         conn.commit()
 
@@ -600,6 +633,24 @@ class TransactionPayload(BaseModel):
     quoteDate: str = ""
     notes: str = ""
     occurredAt: str
+
+
+class TradePlanPayload(BaseModel):
+    id: str
+    kind: str
+    platform: str
+    assetName: str = ""
+    assetType: str = ""
+    symbol: str = ""
+    quantity: float = 0
+    price: float = 0
+    fee: float = 0
+    currency: str = ""
+    fxRate: float = 0
+    quoteSource: str = "manual"
+    quoteDate: str = ""
+    notes: str = ""
+    plannedAt: str = ""
 
 
 app = FastAPI(title="WealthTrack API")
@@ -1120,6 +1171,109 @@ def list_transactions_for_user(conn: sqlite3.Connection, user_id: int) -> list[d
         }
         for row in rows
     ]
+
+
+def row_to_trade_plan(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "kind": row["kind"],
+        "platform": row["platform"],
+        "assetName": row["asset_name"],
+        "assetType": row["asset_type"],
+        "symbol": row["symbol"],
+        "quantity": row["quantity"],
+        "price": row["price"],
+        "fee": row["fee"],
+        "currency": row["currency"],
+        "fxRate": row["fx_rate"],
+        "quoteSource": row["quote_source"],
+        "quoteDate": row["quote_date"],
+        "notes": row["notes"],
+        "plannedAt": row["planned_at"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def list_trade_plans_for_user(conn: sqlite3.Connection, user_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT id, kind, platform, asset_name, asset_type, symbol, quantity, price, fee, currency, fx_rate,
+               quote_source, quote_date, notes, planned_at, created_at, updated_at
+        FROM trade_plans
+        WHERE user_id = ?
+        ORDER BY updated_at DESC, created_at DESC
+        LIMIT 100
+        """,
+        (user_id,),
+    ).fetchall()
+    return [row_to_trade_plan(row) for row in rows]
+
+
+def upsert_trade_plan(conn: sqlite3.Connection, user_id: int, payload: TradePlanPayload) -> None:
+    kind = str(payload.kind or "").strip().lower()
+    if kind not in {"asset", "buy", "sell"}:
+        raise HTTPException(status_code=400, detail="交易计划仅支持建仓、加仓或减仓")
+    platform = str(payload.platform or "").strip().lower()
+    asset_type = str(payload.assetType or "").strip().lower()
+    symbol = str(payload.symbol or "").strip().upper()
+    quantity = float(payload.quantity or 0)
+    valid_asset_types = {"fund", "stock", "crypto", "cash", "liability"} if kind == "asset" else {"fund", "stock", "crypto"}
+    if not platform or asset_type not in valid_asset_types or not symbol or quantity <= 0:
+        raise HTTPException(status_code=400, detail="交易计划需要有效的资产、数量和平台")
+
+    existing = conn.execute(
+        "SELECT created_at FROM trade_plans WHERE id = ? AND user_id = ?",
+        (payload.id, user_id),
+    ).fetchone()
+    now_text = now_iso()
+    created_text = existing["created_at"] if existing else now_text
+    planned_at = str(payload.plannedAt or "").strip() or now_text
+    conn.execute(
+        """
+        INSERT INTO trade_plans (
+            id, user_id, kind, platform, asset_name, asset_type, symbol, quantity, price, fee,
+            currency, fx_rate, quote_source, quote_date, notes, planned_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            user_id = excluded.user_id,
+            kind = excluded.kind,
+            platform = excluded.platform,
+            asset_name = excluded.asset_name,
+            asset_type = excluded.asset_type,
+            symbol = excluded.symbol,
+            quantity = excluded.quantity,
+            price = excluded.price,
+            fee = excluded.fee,
+            currency = excluded.currency,
+            fx_rate = excluded.fx_rate,
+            quote_source = excluded.quote_source,
+            quote_date = excluded.quote_date,
+            notes = excluded.notes,
+            planned_at = excluded.planned_at,
+            updated_at = excluded.updated_at
+        """,
+        (
+            payload.id,
+            user_id,
+            kind,
+            platform,
+            str(payload.assetName or "").strip(),
+            asset_type,
+            symbol,
+            quantity,
+            float(payload.price or 0),
+            float(payload.fee or 0),
+            str(payload.currency or get_platform_currency(platform)).strip().upper(),
+            float(payload.fxRate or 0),
+            str(payload.quoteSource or "manual").strip(),
+            str(payload.quoteDate or "").strip(),
+            str(payload.notes or "").strip(),
+            planned_at,
+            created_text,
+            now_text,
+        ),
+    )
 
 
 def apply_transaction_effect(conn: sqlite3.Connection, user_id: int, payload: TransactionPayload) -> dict[str, Any]:
@@ -2379,6 +2533,67 @@ def list_transactions(session_cookie: str | None = Cookie(default=None, alias=SE
     return {"transactions": transactions}
 
 
+@app.get("/api/trade-plans")
+def list_trade_plans(session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        trade_plans = list_trade_plans_for_user(conn, int(user["id"]))
+    return {"tradePlans": trade_plans}
+
+
+@app.post("/api/trade-plans")
+def create_trade_plan(
+    payload: TradePlanPayload,
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        upsert_trade_plan(conn, int(user["id"]), payload)
+        row = conn.execute(
+            """
+            SELECT id, kind, platform, asset_name, asset_type, symbol, quantity, price, fee, currency, fx_rate,
+                   quote_source, quote_date, notes, planned_at, created_at, updated_at
+            FROM trade_plans
+            WHERE id = ? AND user_id = ?
+            """,
+            (payload.id, int(user["id"])),
+        ).fetchone()
+        conn.commit()
+    return {"tradePlan": row_to_trade_plan(row)}
+
+
+@app.put("/api/trade-plans/{plan_id}")
+def update_trade_plan(
+    plan_id: str,
+    payload: TradePlanPayload,
+    session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE),
+) -> dict[str, Any]:
+    user = get_current_user(session_cookie)
+    normalized_payload = payload.model_copy(update={"id": plan_id})
+    with closing(get_db()) as conn:
+        upsert_trade_plan(conn, int(user["id"]), normalized_payload)
+        row = conn.execute(
+            """
+            SELECT id, kind, platform, asset_name, asset_type, symbol, quantity, price, fee, currency, fx_rate,
+                   quote_source, quote_date, notes, planned_at, created_at, updated_at
+            FROM trade_plans
+            WHERE id = ? AND user_id = ?
+            """,
+            (plan_id, int(user["id"])),
+        ).fetchone()
+        conn.commit()
+    return {"tradePlan": row_to_trade_plan(row)}
+
+
+@app.delete("/api/trade-plans/{plan_id}")
+def delete_trade_plan(plan_id: str, session_cookie: str | None = Cookie(default=None, alias=SESSION_COOKIE)) -> dict[str, str]:
+    user = get_current_user(session_cookie)
+    with closing(get_db()) as conn:
+        conn.execute("DELETE FROM trade_plans WHERE id = ? AND user_id = ?", (plan_id, int(user["id"])))
+        conn.commit()
+    return {"message": "ok"}
+
+
 @app.get("/api/external/portfolio")
 def external_portfolio(
     username: str = ADMIN_USERNAME,
@@ -2741,6 +2956,7 @@ def clear_all_records(session_cookie: str | None = Cookie(default=None, alias=SE
     user = get_current_user(session_cookie)
     with closing(get_db()) as conn:
         conn.execute("DELETE FROM transactions WHERE user_id = ?", (int(user["id"]),))
+        conn.execute("DELETE FROM trade_plans WHERE user_id = ?", (int(user["id"]),))
         conn.execute("DELETE FROM assets WHERE user_id = ?", (int(user["id"]),))
         conn.execute("DELETE FROM account_balances WHERE user_id = ?", (int(user["id"]),))
         conn.commit()
