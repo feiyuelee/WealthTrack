@@ -139,6 +139,20 @@ export function App() {
     };
   }, [portfolio]);
 
+  if (!user) {
+    return (
+      <LoginPage
+        isLoading={isLoading}
+        loginName={loginName}
+        password={password}
+        message={message}
+        onNameChange={setLoginName}
+        onPasswordChange={setPassword}
+        onSubmit={handleLogin}
+      />
+    );
+  }
+
   return (
     <div className="shell">
       <aside className="sidebar">
@@ -177,34 +191,18 @@ export function App() {
             <button className="icon-button" type="button" onClick={refresh} disabled={!user || isRefreshing} title="刷新">
               <RefreshCw size={18} className={isRefreshing ? "spin" : ""} />
             </button>
-            {user ? (
-              <button className="secondary-button" type="button" onClick={handleLogout}>
-                <LogOut size={16} />
-                退出
-              </button>
-            ) : null}
+            <button className="secondary-button" type="button" onClick={handleLogout}>
+              <LogOut size={16} />
+              退出
+            </button>
           </div>
         </header>
 
-        {!user ? (
-          <LoginPanel
-            isLoading={isLoading}
-            loginName={loginName}
-            password={password}
-            message={message}
-            onNameChange={setLoginName}
-            onPasswordChange={setPassword}
-            onSubmit={handleLogin}
-          />
-        ) : (
-          <>
-            {message ? <div className="message">{message}</div> : null}
-            {activeView === "overview" ? <Overview totals={totals} assets={filteredAssets} plans={portfolio.tradePlans} /> : null}
-            {activeView === "positions" ? <Positions assets={filteredAssets} /> : null}
-            {activeView === "plans" ? <Plans plans={portfolio.tradePlans} assets={portfolio.assets} onChanged={loadPortfolio} /> : null}
-            {activeView === "records" ? <Records transactions={portfolio.transactions} /> : null}
-          </>
-        )}
+        {message ? <div className="message">{message}</div> : null}
+        {activeView === "overview" ? <Overview totals={totals} assets={filteredAssets} plans={portfolio.tradePlans} /> : null}
+        {activeView === "positions" ? <Positions assets={filteredAssets} /> : null}
+        {activeView === "plans" ? <Plans plans={portfolio.tradePlans} assets={portfolio.assets} onChanged={loadPortfolio} /> : null}
+        {activeView === "records" ? <Records transactions={portfolio.transactions} /> : null}
       </main>
     </div>
   );
@@ -226,7 +224,7 @@ function NavButton(props: { icon: React.ReactNode; label: string; active: boolea
   );
 }
 
-function LoginPanel(props: {
+function LoginPage(props: {
   isLoading: boolean;
   loginName: string;
   password: string;
@@ -236,18 +234,35 @@ function LoginPanel(props: {
   onSubmit: (event: FormEvent) => void;
 }) {
   return (
-    <section className="login-panel">
-      <div>
-        <p>需要登录</p>
-        <h2>{props.isLoading ? "正在连接当前账户" : "登录后查看真实资产数据"}</h2>
-      </div>
-      <form className="login-form" onSubmit={props.onSubmit}>
-        <input value={props.loginName} onChange={(event) => props.onNameChange(event.target.value)} placeholder="用户名" autoComplete="username" />
-        <input value={props.password} onChange={(event) => props.onPasswordChange(event.target.value)} placeholder="密码" type="password" autoComplete="current-password" />
-        <button className="primary-button" type="submit">登录</button>
-      </form>
-      {props.message ? <span className="form-note">{props.message}</span> : null}
-    </section>
+    <main className="login-page">
+      <section className="login-hero">
+        <div className="brand login-brand">
+          <div className="brand-mark">W</div>
+          <div>
+            <strong>WealthTrack</strong>
+            <span>Portfolio command center</span>
+          </div>
+        </div>
+        <div className="login-copy">
+          <p>前端重构预览</p>
+          <h1>{props.isLoading ? "正在连接账户" : "登录 WealthTrack"}</h1>
+          <span>登录后进入资产总览、交易计划和操作记录工作台。</span>
+        </div>
+      </section>
+
+      <section className="login-card">
+        <div>
+          <p>账户登录</p>
+          <h2>查看真实资产数据</h2>
+        </div>
+        <form className="login-form" onSubmit={props.onSubmit}>
+          <input value={props.loginName} onChange={(event) => props.onNameChange(event.target.value)} placeholder="用户名" autoComplete="username" />
+          <input value={props.password} onChange={(event) => props.onPasswordChange(event.target.value)} placeholder="密码" type="password" autoComplete="current-password" />
+          <button className="primary-button" type="submit">登录</button>
+        </form>
+        {props.message ? <span className="form-note">{props.message}</span> : null}
+      </section>
+    </main>
   );
 }
 
